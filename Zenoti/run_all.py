@@ -16,7 +16,9 @@ SCRIPTS = [
     "cash.py",
     "memberships.py",
     "stock_ledger.py",
-    "business_kpi.py",
+    "business_kpi_v2.py",
+    "fb_ads.py",
+    "google_ads.py",
 ]
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
