@@ -22,6 +22,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 CSV_SOURCE = os.getenv("CSV_SOURCE", "local").lower()
 if CSV_SOURCE == "gdrive":
+    print("Checking Google Drive for FB Ads CSV files...")
     from gdrive_helper import get_csv_from_gdrive
     CSV_FILE = get_csv_from_gdrive(
         os.getenv("GDRIVE_FOLDER_FB_ADS"),
