@@ -108,6 +108,15 @@ def normalize_col(col_name):
 sql_column_lookup = {normalize_col(c): c for c in sql_columns}
 
 # ==================================
+# Helper: Extract date from filename
+# ==================================
+def extract_date_from_filename(filename):
+    match = re.match(r'^GoogleAds_(\d{4}-\d{2}-\d{2})\.csv$', filename, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+# ==================================
 # Load CSV(s) and process one file at a time
 # ==================================
 if not CSV_FILE:
@@ -117,9 +126,16 @@ csv_paths = []
 if os.path.isdir(CSV_FILE):
     for f in sorted(os.listdir(CSV_FILE)):
         if f.lower().endswith('.csv'):
-            csv_paths.append(os.path.join(CSV_FILE, f))
+            if extract_date_from_filename(f):
+                csv_paths.append(os.path.join(CSV_FILE, f))
+            else:
+                print(f"SKIPPED: '{f}' — filename must follow format GoogleAds_<YYYY-MM-DD>.csv")
 elif os.path.isfile(CSV_FILE):
-    csv_paths = [CSV_FILE]
+    fname = os.path.basename(CSV_FILE)
+    if extract_date_from_filename(fname):
+        csv_paths = [CSV_FILE]
+    else:
+        raise ValueError(f"Invalid filename: '{fname}' — filename must follow format GoogleAds_<YYYY-MM-DD>.csv")
 else:
     raise ValueError(f"CSV_FILE_GOOGLE_ADS path does not exist: {CSV_FILE}")
 
