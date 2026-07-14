@@ -29,6 +29,10 @@ if CSV_SOURCE == "gdrive":
         credentials_file=os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json"),
     )
 
+if not CSV_FILE:
+    print("SKIP: No CSV file available for google_ads. Exiting.")
+    exit(0)
+
 if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
     missing = [k for k, v in {"SERVER": SERVER, "DATABASE": DATABASE, "DB_USER": DB_USER, "DB_PASSWORD": DB_PASSWORD}.items() if not v]
     raise ValueError(f"Missing environment variables in .env file: {', '.join(missing)}")
@@ -69,6 +73,7 @@ def check_and_reconnect(conn, conn_str, timeout=5):
 
 # establish initial connection
 conn, cursor = ensure_connection(conn_str)
+print(f"Connected to {DATABASE} on {SERVER}")
 
 # ==================================
 # Get SQL Columns
@@ -289,3 +294,4 @@ for csv_path in csv_paths:
 
 cursor.close()
 conn.close()
+print("\nDone.")
