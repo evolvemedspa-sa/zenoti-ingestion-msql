@@ -43,6 +43,7 @@ if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
 # ==================================
 conn_str = (
     f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+    # f"DRIVER={{SQL Server}};"
     f"SERVER={SERVER};"
     f"DATABASE={DATABASE};"
     f"UID={DB_USER};"
@@ -164,14 +165,6 @@ for key_name in MATCH_KEY_NAMES:
         raise ValueError(f"Could not find '{key_name}' column in the SQL table. Cannot proceed with upsert logic.")
     match_key_cols.append(sql_col)
 
-update_columns = [c for c in insert_columns if c not in match_key_cols]
-
-update_sql = f"""
-UPDATE {table_qualified}
-SET {', '.join(f'[{c}] = ?' for c in update_columns)}
-WHERE {' AND '.join(f'[{c}] = ?' for c in match_key_cols)}
-"""
-
 insert_sql = f"""
 INSERT INTO {table_qualified}
 ({','.join(f'[{c}]' for c in insert_columns)})
@@ -272,55 +265,64 @@ for csv_path in csv_paths:
     # Fetch existing key combos from SQL
     key_select = ', '.join(f'[{c}]' for c in match_key_cols)
     cursor.execute(f"SELECT DISTINCT {key_select} FROM {table_qualified}")
-    existing_keys = {tuple(row) for row in cursor.fetchall()}
-    print(f"Found {len(existing_keys)} existing row(s) in SQL")
 
-    # Upsert: UPDATE existing, INSERT new
-    updated = 0
-    inserted = 0
-    errors = 0
-
-    for idx, row_series in df.iterrows():
-        row_dict = row_series.to_dict()
-
-        row_values = []
-        for c in insert_columns:
-            v = row_dict[c]
-            if pd.isna(v) if not isinstance(v, str) else False:
-                row_values.append(None)
-            else:
-                row_values.append(v)
-
-        key_vals = tuple(row_values[insert_columns.index(c)] for c in match_key_cols)
-
-        if key_vals in existing_keys:
-            update_values = [row_values[insert_columns.index(c)] for c in update_columns]
-            update_values.extend(key_vals)
+    def _normalize_key(val):
+        if val is None:
+            return None
+        if hasattr(val, 'strftime'):
+            return val.strftime('%Y/%m/%d')
+        s = str(val)
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+            return s.replace('-', '/')
+        if '.' in s:
             try:
-                cursor.execute(update_sql, update_values)
-                updated += 1
-            except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
-                print(f"UPDATE failed (row {idx + 2}): {e}")
-                errors += 1
-        else:
-            try:
-                cursor.execute(insert_sql, row_values)
-                inserted += 1
-                existing_keys.add(key_vals)
-            except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
-                print(f"INSERT failed (row {idx + 2}): {e}")
-                errors += 1
+                f = float(s)
+                if f == int(f):
+                    return str(int(f))
+            except (ValueError, OverflowError):
+                pass
+        return s
 
-    try:
-        conn.commit()
-        print(f"\nResults for {os.path.basename(csv_path)}:")
-        print(f"  Updated: {updated:,} rows")
-        print(f"  Inserted: {inserted:,} rows")
-        if errors:
-            print(f"  Errors: {errors:,} rows")
-    except Exception as e:
-        print(f"Commit failed: {e}")
-        conn.rollback()
+    existing_keys = {tuple(_normalize_key(v) for v in row) for row in cursor.fetchall()}
+    print(f"Found {len(existing_keys)} existing key combo(s) in SQL")
+
+    total = len(df)
+
+    # Filter out rows whose match keys already exist in DB
+    key_col_indices = [insert_columns.index(c) for c in match_key_cols]
+    all_rows = df.astype(object).where(df.notnull(), None).values.tolist()
+
+    def _make_csv_key(row):
+        return tuple(_normalize_key(row[i]) for i in key_col_indices)
+
+    data_to_insert = [row for row in all_rows if _make_csv_key(row) not in existing_keys]
+    skipped = total - len(data_to_insert)
+
+    if skipped:
+        print(f"  Skipped {skipped:,} row(s) already in DB")
+
+    if not data_to_insert:
+        print(f"  No new rows to insert for {os.path.basename(csv_path)}")
+        continue
+
+    # Batch insert new rows only
+    insert_count = len(data_to_insert)
+    print(f"  Batch inserting {insert_count:,} new rows...")
+    cursor.fast_executemany = True
+    batch_size = 1000
+    for start in range(0, insert_count, batch_size):
+        end = min(start + batch_size, insert_count)
+        batch = data_to_insert[start:end]
+        try:
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        print(f"  Progress: {end:,}/{insert_count:,} rows inserted", flush=True)
+
+    print(f"\nResults for {os.path.basename(csv_path)}:")
+    print(f"  Skipped: {skipped:,} | Inserted: {insert_count:,}")
 
 cursor.close()
 conn.close()
