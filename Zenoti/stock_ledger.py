@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import re
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
@@ -50,6 +54,7 @@ conn_str = (
 
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
+log("Connect", f"{DATABASE} on {SERVER}")
 
 # ==================================
 # Get SQL Columns
@@ -76,7 +81,7 @@ rows = cursor.fetchall()
 sql_columns = [row[0] for row in rows]
 identity_columns = {row[0] for row in rows if row[1] == 1}
 
-print(f"Found {len(sql_columns)} SQL columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
+log("Schema", f"{len(sql_columns)} columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
 
 # Helper to normalize column names for matching between CSV and SQL
 def normalize_col(col_name):
@@ -119,9 +124,8 @@ VALUES
 cursor.fast_executemany = True
 
 for csv_path in csv_paths:
-    print(f"Processing CSV: {csv_path}")
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    print(f"Found {len(df):,} rows in {os.path.basename(csv_path)}")
+    log("Load", f"{os.path.basename(csv_path)} → {len(df):,} rows")
 
     # ==================================
     # Align CSV Columns with SQL Headers (per-file)
@@ -221,7 +225,7 @@ for csv_path in csv_paths:
     # ==================================
     # Numeric Type Conversion
     # ==================================
-    for col in [c for c in df.columns if normalize_col(c) != "ingestion_timestamp"]:
+    for col in [c for c in df.columns if normalize_col(c) not in {"ingestion_timestamp", "date_inserted"}]:
         test_numeric = pd.to_numeric(df[col], errors='coerce')
         if test_numeric.notnull().sum() == df[col].notnull().sum() and df[col].notnull().sum() > 0:
             if (test_numeric.dropna() % 1 == 0).all():
@@ -239,7 +243,8 @@ for csv_path in csv_paths:
     try:
         cursor.executemany(insert_sql, data_to_insert)
         conn.commit()
-        print(f"Inserted {len(df):,} rows successfully from {os.path.basename(csv_path)}.")
+        log("Insert", f"{len(df):,} rows")
+        log("Failed", "0 rows")
     except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
         print(f"Data insertion failed for {os.path.basename(csv_path)}: {e}")
         conn.rollback()
@@ -265,3 +270,4 @@ for csv_path in csv_paths:
 # Close DB resources
 cursor.close()
 conn.close()
+log("Done")

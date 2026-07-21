@@ -5,6 +5,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import re
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
@@ -51,6 +55,7 @@ conn_str = (
 
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
+log("Connect", f"{DATABASE} on {SERVER}")
 
 # ==================================
 # Get SQL Columns
@@ -73,6 +78,8 @@ WHERE TABLE_NAME = '{TABLE}' AND COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + T
 cursor.execute(identity_sql)
 identity_columns = [row[0] for row in cursor.fetchall()]
 
+log("Schema", f"{len(sql_columns)} columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
+
 
 # ==================================
 # Load CSV
@@ -82,7 +89,7 @@ df = pd.read_csv(
     dtype=str,
     keep_default_na=False
 )
-print(f"Processing {len(df):,} rows from {os.path.basename(CSV_FILE)}")
+log("Load", f"{os.path.basename(CSV_FILE)} → {len(df):,} rows")
 
 # ==================================
 # Align CSV Columns with SQL Headers
@@ -259,7 +266,8 @@ data_to_insert = df.astype(object).where(df.notnull(), None).values.tolist()
 try:
     cursor.executemany(insert_sql, data_to_insert)
     conn.commit()
-    print(f"Inserted {len(df):,} rows successfully from {os.path.basename(CSV_FILE)}.")
+    log("Insert", f"{len(df):,} rows")
+    log("Failed", "0 rows")
 except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
     print(f"Data insertion failed: {e}")
     conn.rollback()
@@ -281,3 +289,4 @@ except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
 finally:
     cursor.close()
     conn.close()
+    log("Done")

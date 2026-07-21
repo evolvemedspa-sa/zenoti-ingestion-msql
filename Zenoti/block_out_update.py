@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(dotenv_path)
@@ -66,7 +70,7 @@ conn_str = (
 # ==================================
 try:
     df = pd.read_csv(CSV_FILE, dtype=str, keep_default_na=False)
-    print(f"Processing {len(df):,} rows from {os.path.basename(CSV_FILE)}")
+    log("Load", f"{os.path.basename(CSV_FILE)} → {len(df):,} rows")
 except FileNotFoundError:
     raise FileNotFoundError(f"The specified CSV file was not found: {CSV_FILE}")
 
@@ -137,6 +141,7 @@ failed_rows = 0
 try:
     with pyodbc.connect(conn_str) as conn:
         cursor = conn.cursor()
+        log("Connect", f"{DATABASE} on {SERVER}")
         for index, row in df.iterrows():
             # Define the values for the WHERE clause from the CSV row
             where_conditions = {
@@ -273,7 +278,9 @@ try:
         if updated_rows > 0 or inserted_rows > 0 or deleted_rows > 0:
             conn.commit()
 
-        print(f"Updated: {updated_rows}, Inserted: {inserted_rows}, Deleted: {deleted_rows}, Failed: {failed_rows}")
+        log("Insert", f"Updated: {updated_rows:,} | Inserted: {inserted_rows:,} | Deleted: {deleted_rows:,}")
+        log("Failed", f"{failed_rows} rows")
+        log("Done")
 
 except pyodbc.Error as ex:
     sqlstate = ex.args[0]

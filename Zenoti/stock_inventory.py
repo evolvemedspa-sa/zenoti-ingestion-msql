@@ -5,6 +5,7 @@ import pyodbc
 from dotenv import load_dotenv
 from datetime import datetime
 import re
+from decimal import Decimal, InvalidOperation
 
 
 def log(step, msg=""):
@@ -19,8 +20,8 @@ load_dotenv(dotenv_path)
 # ==================================
 SERVER = os.getenv("SERVER")
 DATABASE = os.getenv("DATABASE")
-TABLE = os.getenv("TABLE_CASH")
-CSV_FILE = os.getenv("CSV_FILE_CASH")
+TABLE = os.getenv("TABLE_STOCK_INVENTORY")
+CSV_FILE = os.getenv("CSV_FILE_STOCK_INVENTORY")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
@@ -28,14 +29,9 @@ CSV_SOURCE = os.getenv("CSV_SOURCE", "local").lower()
 if CSV_SOURCE == "gdrive":
     from gdrive_helper import get_csv_from_gdrive
     CSV_FILE = get_csv_from_gdrive(
-        os.getenv("GDRIVE_FOLDER_CASH"),
-        credentials_json=os.getenv("GDRIVE_CREDENTIALS_JSON"),
-        credentials_file=os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json"),
+        os.getenv("GDRIVE_FOLDER_STOCK_INVENTORY"),
+        os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json")
     )
-
-if not CSV_FILE:
-    print("SKIP: No CSV file available for cash. Exiting.")
-    exit(0)
 
 if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
     missing = [k for k, v in {"SERVER": SERVER, "DATABASE": DATABASE, "DB_USER": DB_USER, "DB_PASSWORD": DB_PASSWORD}.items() if not v]
@@ -50,8 +46,6 @@ conn_str = (
     f"DATABASE={DATABASE};"
     f"UID={DB_USER};"
     f"PWD={DB_PASSWORD};"
-    # If you still need Trusted_Connection for other environments, consider conditional logic.
-    # For this error, removing Trusted_Connection=yes and adding UID/PWD is the direct fix.
 )
 
 conn = pyodbc.connect(conn_str)
@@ -110,7 +104,7 @@ else:
     raise ValueError(f"CSV_FILE path does not exist: {CSV_FILE}")
 
 if not csv_paths:
-    print(f"No CSV files found in: {CSV_FILE}")
+    log("Load", f"No CSV files found in: {CSV_FILE}")
 
 # Precompute insert columns (exclude identity columns)
 insert_columns = [c for c in sql_columns if c not in identity_columns]
@@ -121,11 +115,10 @@ INSERT INTO {table_qualified}
 VALUES
 ({','.join(['?'] * len(insert_columns))})
 """
-
-# Prepare cursor for fast inserts
-cursor.fast_executemany = True
+delete_sql = f"DELETE FROM {table_qualified}"
 
 for csv_path in csv_paths:
+    print(f"Processing CSV: {csv_path}")
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     log("Load", f"{os.path.basename(csv_path)} → {len(df):,} rows")
 
@@ -133,39 +126,18 @@ for csv_path in csv_paths:
     # Align CSV Columns with SQL Headers (per-file)
     # ==================================
     MANUAL_MAP = {
-        "Item Type": "item_type",
-        "Payment Date": "payment_date",
-        "Sale Date": "sale_date",
-        "Invoice No": "invoice_no",
-        "Guest Code": "guest_code",
-        "Guest Name": "guest_name",
-        "Center Code": "center_code",
         "Center Name": "center_name",
-        "Item Code": "item_code",
-        "Item Name": "item_name",
-        "Qty": "qty",
-        "Sales Collected (Exc.Tax)": "sales_collected_exc_tax",
-        "Tax Collected": "tax_collected",
-        "Sales Collected (Inc.Tax)": "sales_collected_inc_tax",
-        "Redeemed": "redeemed",
-        "Collected to Date": "collected_as_on_date",
-        "Collected": "collected",
-        "Item Category": "item_category",
-        "Item Subcategory": "item_sub_category",
-        "Discount Name": "discount_name",
-        "Discount": "discount",
-        "Payment Type": "payment_type",
-        "Sale Type": "sale_type",
-        "Sold By": "sold_by",
-        "Status": "status",
-        "Invoice Notes": "invoice_notes",
-        "Referral Source": "referral_source",
-        "Member": "member",
-        "First Visit": "first_visit",
-        "Invoice Source": "invoice_source",
-        "Vendor Name": "vendor_name",
-        "Brand Name": "brand_name",
-        "Invoice For": "invoice_for"
+        "Product Code": "product_code",
+        "Product Name": "product_name",
+        "UOM": "uom",
+        "Product Type": "product_type",
+        "Brand": "brand",
+        "Vendor": "vendor",
+        "On-Hand Quantity": "on_hand_quantity",
+        "Stock Cost (Perpetual Average)": "stock_cost_perpetual_avg",
+        "Business Unit": "business_unit",
+        "Configured Purchase Price": "configured_purchase_price",
+        "Avg Price (Perpetual)": "avg_price_perpetual"
     }
 
     mapping = {}
@@ -230,54 +202,128 @@ for csv_path in csv_paths:
     # ==================================
     # Date/Time Type Conversion
     # ==================================
-    currency_date_columns = {"payment_date", "sale_date"}
+    # Define which columns should be treated as dates.
+    stock_inventory_date_columns = {"date_inserted"}
     for col in df.columns:
-        if normalize_col(col) in currency_date_columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y/%m/%d')
+        if normalize_col(col) in stock_inventory_date_columns:
+            # Coerce invalid dates to NaT (Not a Time), which will become NULL
+            df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d')
 
     # ==================================
-    # Numeric Type Conversion
+    # Numeric Type Conversion (true decimal columns only)
     # ==================================
-    for col in [c for c in df.columns if normalize_col(c) not in {"ingestion_timestamp", "date_inserted"}]:
-        test_numeric = pd.to_numeric(df[col], errors='coerce')
-        if test_numeric.notnull().sum() == df[col].notnull().sum() and df[col].notnull().sum() > 0:
-            if (test_numeric.dropna() % 1 == 0).all():
-                df[col] = test_numeric.round().astype('Int64')
-            else:
-                df[col] = test_numeric
-        else:
-            df[col] = df[col].where(df[col].notnull(), None)
+    # This function will convert numeric strings to Decimal to preserve precision,
+    # but will leave non-numeric strings (like "N/A") as they are.
+    def to_decimal_if_numeric(value):
+        if value is None or isinstance(value, (int, float, Decimal)):
+            return value
+        try:
+            # Using Decimal preserves precision for values like "2.68"
+            return Decimal(value)
+        except (InvalidOperation, TypeError, ValueError):
+            # If it's not a valid number (e.g., "N/A"), return it as is.
+            return value
+
+    # NOTE: configured_purchase_price is intentionally NOT in this list.
+    # That column is varchar(200) in SQL Server and must be able to store
+    # the literal text "N/A" as well as formatted numeric strings like "280.00".
+    # Binding it as SQL_DECIMAL (see sql_type_map below) silently nulls out any
+    # row containing "N/A", so it gets its own text-preserving handling instead.
+    numeric_cols = [
+        "on_hand_quantity",
+        "stock_cost_perpetual_avg",
+        "avg_price_perpetual",
+    ]
+
+    # Resolve normalized names to actual DataFrame column names
+    df_cols_norm_map = {normalize_col(c): c for c in df.columns}
+    cols_to_convert = [df_cols_norm_map[n] for n in numeric_cols if n in df_cols_norm_map]
+
+    for col in cols_to_convert:
+        df[col] = df[col].apply(to_decimal_if_numeric)
 
     # ==================================
-    # Insert Data for this CSV
+    # Mixed Text/Numeric Columns (e.g. configured_purchase_price)
+    # ==================================
+    # These columns are stored as varchar in SQL and can legitimately contain
+    # either a formatted number ("280.00") or a text marker like "N/A".
+    # Numbers are formatted to 2 decimal places as strings; "N/A"/"NA"/blank
+    # pass through as the literal text "N/A" rather than becoming NULL.
+    def format_price_text(value):
+        if value is None:
+            return None
+        s = str(value).strip()
+        if s.upper() in ("N/A", "NA", ""):
+            return "N/A"
+        try:
+            return f"{Decimal(s):.2f}"  # e.g. "280" -> "280.00"
+        except (InvalidOperation, TypeError, ValueError):
+            return s  # unrecognized text, keep as-is rather than guessing
+
+    price_text_cols = ["configured_purchase_price"]
+    price_text_cols_resolved = [df_cols_norm_map[normalize_col(c)] for c in price_text_cols if normalize_col(c) in df_cols_norm_map]
+
+    for col in price_text_cols_resolved:
+        df[col] = df[col].apply(format_price_text)
+
+    # ==================================
+    # Delete existing data and insert new data
     # ==================================
     data_to_insert = df.astype(object).where(df.notnull(), None).values.tolist()
+    total_rows = len(data_to_insert)
 
     try:
+        # 1. Delete all existing rows from the table
+        log("Delete", f"all rows from {table_qualified}...")
+        cursor.execute(delete_sql)
+        log("Delete", f"{cursor.rowcount:,} rows removed")
+
+        # 2. Insert all new rows from the CSV
+        log("Insert", f"{total_rows:,} new rows...")
+        cursor.fast_executemany = True
+
+        # Set input sizes for columns that are not numeric. This helps pyodbc's
+        # fast_executemany mode handle None values correctly for string/text columns,
+        # preventing "Invalid string or buffer length" errors.
+        # We define a max length for VARCHAR columns; 0 means "max".
+        # For decimals, we specify a precision (e.g., 38) and scale (e.g., 10).
+        # Mixed text/numeric columns (like configured_purchase_price) are bound as
+        # VARCHAR so both formatted numbers and "N/A" are stored correctly as text.
+        sql_type_map = []
+        for col_name in df.columns:
+            if col_name in cols_to_convert:
+                # Be explicit about decimal types with precision and scale.
+                sql_type_map.append((pyodbc.SQL_DECIMAL, 38, 10))
+            elif col_name in price_text_cols_resolved:
+                # varchar(200) column - bind as wide varchar with an explicit
+                # length matching the SQL column definition.
+                sql_type_map.append((pyodbc.SQL_WVARCHAR, 200))
+            else:
+                # For all other columns, specify as wide varchar with max length.
+                sql_type_map.append((pyodbc.SQL_WVARCHAR, 0))
+        cursor.setinputsizes(sql_type_map)
+
         cursor.executemany(insert_sql, data_to_insert)
         conn.commit()
-        log("Insert", f"{len(df):,} rows")
+        log("Insert", f"{total_rows:,} rows from {os.path.basename(csv_path)}")
         log("Failed", "0 rows")
+
     except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
         print(f"Data insertion failed for {os.path.basename(csv_path)}: {e}")
         conn.rollback()
 
-        print("Searching for problematic row...")
+        # Fallback to row-by-row insert to find the problematic record
+        print("Searching for the problematic row...")
         cursor.fast_executemany = False
         for i, row in enumerate(data_to_insert):
             try:
                 cursor.execute(insert_sql, row)
             except (pyodbc.DataError, pyodbc.ProgrammingError) as row_e:
-                param_info = ""
-                if "Parameter" in str(row_e):
-                    match = re.search(r"Parameter (\d+)", str(row_e))
-                    if match:
-                        param_idx = int(match.group(1)) - 1
-                        param_info = f" (column: {sql_columns[param_idx]})"
-                print(f"Error at {os.path.basename(csv_path)} row {i + 2}{param_info}: {row_e}")
+                print(f"--- Error found in CSV {os.path.basename(csv_path)} row {i + 2} ---")
+                print(f"Data: {dict(zip(insert_columns, row))}")
+                print(f"Error Details: {row_e}")
                 break
 
 # Close DB resources
 cursor.close()
 conn.close()
-log("Done")

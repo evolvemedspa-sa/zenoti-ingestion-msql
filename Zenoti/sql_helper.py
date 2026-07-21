@@ -5,6 +5,10 @@ import pyodbc
 from dotenv import load_dotenv
 from gdrive_helper import list_csv_filenames
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(dotenv_path)
 
@@ -91,13 +95,12 @@ def delete_data_for_range(cursor, table, date_column, start_date, end_date):
 
 
 def main():
-    print(f"Database: {SERVER} / {DATABASE} | CSV source: {CSV_SOURCE}")
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+    log("Connect", f"{DATABASE} on {SERVER}")
 
     credentials_json = os.getenv("GDRIVE_CREDENTIALS_JSON")
     credentials_file = os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json")
-
-    conn = pyodbc.connect(conn_str)
-    cursor = conn.cursor()
 
     total_deleted = 0
 
@@ -140,7 +143,7 @@ def main():
 
         try:
             deleted = delete_data_for_range(cursor, table, config["date_column"], start_date, end_date)
-            print(f"  {table}: deleted {deleted:,} rows ({start_date} to {end_date})")
+            log("Delete", f"{table}: {deleted:,} rows ({start_date} to {end_date})")
             total_deleted += deleted
         except pyodbc.Error as e:
             print(f"  ERROR: DELETE failed for {table}: {e}")
@@ -148,10 +151,11 @@ def main():
             raise
 
     conn.commit()
-    print(f"\nAll deletes committed. Total rows deleted: {total_deleted:,}")
+    log("Delete", f"Total: {total_deleted:,} rows committed")
 
     cursor.close()
     conn.close()
+    log("Done")
 
 
 if __name__ == "__main__":

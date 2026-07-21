@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import re
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
 
@@ -39,6 +43,7 @@ conn_str = (
 
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
+log("Connect", f"{DATABASE} on {SERVER}")
 
 # ==================================
 # Get SQL Columns
@@ -64,7 +69,7 @@ rows = cursor.fetchall()
 sql_columns = [row[0] for row in rows]
 identity_columns = {row[0] for row in rows if row[1] == 1}
 
-print(f"Found {len(sql_columns)} SQL columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
+log("Schema", f"{len(sql_columns)} columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
 
 def normalize_col(col_name):
     return col_name.strip().strip('.,').replace(" ", "_").replace("-", "_").lower()
@@ -148,9 +153,8 @@ VALUES
 """
 
 for csv_path in csv_paths:
-    print(f"\nProcessing CSV: {csv_path}")
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    print(f"Found {len(df):,} rows in {os.path.basename(csv_path)}")
+    log("Load", f"{os.path.basename(csv_path)} → {len(df):,} rows")
 
     # ==================================
     # Column Mapping
@@ -236,7 +240,6 @@ for csv_path in csv_paths:
         if "business_kpi_date" in sql_column_lookup:
             col_name = sql_column_lookup["business_kpi_date"]
             df[col_name] = kpi_date
-            print(f"Set business_kpi_date = {kpi_date} (from filename)")
 
     # ==================================
     # Add Metadata Columns
@@ -314,7 +317,6 @@ for csv_path in csv_paths:
     # ==================================
     cursor.execute(f"SELECT DISTINCT [{CENTER_NAME_SQL_COL}] FROM {table_qualified}")
     existing_centers = {row[0] for row in cursor.fetchall()}
-    print(f"Found {len(existing_centers)} existing center(s) in SQL")
 
     # ==================================
     # Upsert: UPDATE existing, INSERT new
@@ -358,15 +360,12 @@ for csv_path in csv_paths:
 
     try:
         conn.commit()
-        print(f"\nResults for {os.path.basename(csv_path)}:")
-        print(f"  Updated: {updated:,} rows")
-        print(f"  Inserted: {inserted:,} rows")
-        if errors:
-            print(f"  Errors: {errors:,} rows")
+        log("Insert", f"Updated: {updated:,} | Inserted: {inserted:,}")
+        log("Failed", f"{errors} rows")
     except Exception as e:
         print(f"Commit failed: {e}")
         conn.rollback()
 
 cursor.close()
 conn.close()
-print("\nDone.")
+log("Done")

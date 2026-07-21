@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import re
 
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
@@ -22,7 +26,6 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 CSV_SOURCE = os.getenv("CSV_SOURCE", "local").lower()
 if CSV_SOURCE == "gdrive":
-    print("Checking Google Drive for FB Ads CSV files...")
     from gdrive_helper import get_csv_from_gdrive
     CSV_FILE = get_csv_from_gdrive(
         os.getenv("GDRIVE_FOLDER_FB_ADS"),
@@ -83,7 +86,7 @@ def check_and_reconnect(conn, conn_str, timeout=5):
 
 # establish initial connection
 conn, cursor = ensure_connection(conn_str)
-print(f"Connected to {DATABASE} on {SERVER}")
+log("Connect", f"{DATABASE} on {SERVER}")
 
 # ==================================
 # Get SQL Columns
@@ -110,7 +113,7 @@ rows = cursor.fetchall()
 sql_columns = [row[0] for row in rows]
 identity_columns = {row[0] for row in rows if row[1] == 1}
 
-print(f"Found {len(sql_columns)} SQL columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
+log("Schema", f"{len(sql_columns)} columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
 
 # Helper to normalize column names for matching between CSV and SQL
 def normalize_col(col_name):
@@ -173,9 +176,8 @@ VALUES
 """
 
 for csv_path in csv_paths:
-    print(f"Processing CSV: {csv_path}")
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    print(f"Found {len(df):,} rows in {os.path.basename(csv_path)}")
+    log("Load", f"{os.path.basename(csv_path)} → {len(df):,} rows")
 
     # ==================================
     # Align CSV Columns with SQL Headers (per-file)
@@ -284,7 +286,6 @@ for csv_path in csv_paths:
         return s
 
     existing_keys = {tuple(_normalize_key(v) for v in row) for row in cursor.fetchall()}
-    print(f"Found {len(existing_keys)} existing key combo(s) in SQL")
 
     total = len(df)
 
@@ -298,16 +299,13 @@ for csv_path in csv_paths:
     data_to_insert = [row for row in all_rows if _make_csv_key(row) not in existing_keys]
     skipped = total - len(data_to_insert)
 
-    if skipped:
-        print(f"  Skipped {skipped:,} row(s) already in DB")
-
     if not data_to_insert:
-        print(f"  No new rows to insert for {os.path.basename(csv_path)}")
+        log("Insert", f"Skipped: {skipped:,} | Inserted: 0")
+        log("Failed", "0 rows")
         continue
 
     # Batch insert new rows only
     insert_count = len(data_to_insert)
-    print(f"  Batch inserting {insert_count:,} new rows...")
     cursor.fast_executemany = True
     batch_size = 1000
     for start in range(0, insert_count, batch_size):
@@ -319,11 +317,10 @@ for csv_path in csv_paths:
         except Exception:
             conn.rollback()
             raise
-        print(f"  Progress: {end:,}/{insert_count:,} rows inserted", flush=True)
 
-    print(f"\nResults for {os.path.basename(csv_path)}:")
-    print(f"  Skipped: {skipped:,} | Inserted: {insert_count:,}")
+    log("Insert", f"Skipped: {skipped:,} | Inserted: {insert_count:,}")
+    log("Failed", "0 rows")
 
 cursor.close()
 conn.close()
-print("\nDone.")
+log("Done")
