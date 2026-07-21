@@ -55,7 +55,7 @@ conn_str = (
 
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
-log("Connect", f"{DATABASE} on {SERVER}")
+log("Connect", "Connected to Evolve Med Spa Server")
 
 # ==================================
 # Get SQL Columns

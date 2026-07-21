@@ -78,7 +78,7 @@ def check_and_reconnect(conn, conn_str, timeout=5):
 
 # establish initial connection
 conn, cursor = ensure_connection(conn_str)
-log("Connect", f"{DATABASE} on {SERVER}")
+log("Connect", "Connected to Evolve Med Spa Server")
 
 # ==================================
 # Get SQL Columns

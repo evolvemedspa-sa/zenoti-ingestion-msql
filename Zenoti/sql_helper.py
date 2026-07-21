@@ -97,7 +97,7 @@ def delete_data_for_range(cursor, table, date_column, start_date, end_date):
 def main():
     conn = pyodbc.connect(conn_str)
     cursor = conn.cursor()
-    log("Connect", f"{DATABASE} on {SERVER}")
+    log("Connect", "Connected to Evolve Med Spa Server")
 
     credentials_json = os.getenv("GDRIVE_CREDENTIALS_JSON")
     credentials_file = os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json")

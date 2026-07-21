@@ -141,7 +141,7 @@ failed_rows = 0
 try:
     with pyodbc.connect(conn_str) as conn:
         cursor = conn.cursor()
-        log("Connect", f"{DATABASE} on {SERVER}")
+        log("Connect", "Connected to Evolve Med Spa Server")
         for index, row in df.iterrows():
             # Define the values for the WHERE clause from the CSV row
             where_conditions = {

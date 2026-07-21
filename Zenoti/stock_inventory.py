@@ -51,7 +51,7 @@ conn_str = (
 
 conn = pyodbc.connect(conn_str)
 cursor = conn.cursor()
-log("Connect", f"{DATABASE} on {SERVER}")
+log("Connect", "Connected to Evolve Med Spa Server")
 
 # ==================================
 # Get SQL Columns
@@ -275,7 +275,7 @@ for csv_path in csv_paths:
 
     try:
         # 1. Delete all existing rows from the table
-        log("Delete", f"all rows from {table_qualified}...")
+        log("Delete", "Delete All rows from Stock Inventory Table")
         cursor.execute(delete_sql)
         log("Delete", f"{cursor.rowcount:,} rows removed")
 
