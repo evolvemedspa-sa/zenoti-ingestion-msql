@@ -69,3 +69,4 @@ Zenoti/cost_of_goods/
 Zenoti/dbquery/delete_ads_by_date.py
 Zenoti/dbquery/list_tables.py
 Zenoti/dbquery/export_to_csv.py
+Zenoti/stock_inventory-old.py

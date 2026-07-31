@@ -16,7 +16,7 @@ SCRIPTS = [
     "cash.py",
     "memberships.py",
     "stock_ledger.py",
-    "stock_inventory.py",
+    # "stock_inventory.py",  # disabled
     "business_kpi_v2.py",
     "fb_ads.py",
     "google_ads.py",
