@@ -29,6 +29,10 @@ if CSV_SOURCE == "gdrive":
         credentials_file=os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json"),
     )
 
+if not CSV_FILE:
+    print("SKIP: No CSV file available for business_kpi. Exiting.")
+    exit(0)
+
 if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
     missing = [k for k, v in {"SERVER": SERVER, "DATABASE": DATABASE, "DB_USER": DB_USER, "DB_PASSWORD": DB_PASSWORD}.items() if not v]
     raise ValueError(f"Missing environment variables in .env file: {', '.join(missing)}")
