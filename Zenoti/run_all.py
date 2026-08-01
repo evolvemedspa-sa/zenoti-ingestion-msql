@@ -16,10 +16,12 @@ SCRIPTS = [
     "cash.py",
     "memberships.py",
     "stock_ledger.py",
-    # "stock_inventory.py",  # disabled
     "business_kpi_v2.py",
     "fb_ads.py",
     "google_ads.py",
+    # stock_inventory.py runs last: it appends a full stock snapshot and is the
+    # slowest step, so a failure here should not hold up the other loads.
+    "stock_inventory.py",
 ]
 
 script_dir = os.path.dirname(os.path.abspath(__file__))

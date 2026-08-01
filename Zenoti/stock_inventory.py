@@ -31,7 +31,8 @@ if CSV_SOURCE == "gdrive":
     from gdrive_helper import get_csv_from_gdrive
     CSV_FILE = get_csv_from_gdrive(
         os.getenv("GDRIVE_FOLDER_STOCK_INVENTORY"),
-        os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json")
+        credentials_json=os.getenv("GDRIVE_CREDENTIALS_JSON"),
+        credentials_file=os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json"),
     )
 
 if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
@@ -42,7 +43,8 @@ if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
 # Build Connection String
 # ==================================
 conn_str = (
-    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+    # f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+    f"DRIVER={{SQL Server}};"
     f"SERVER={SERVER};"
     f"DATABASE={DATABASE};"
     f"UID={DB_USER};"
@@ -65,7 +67,11 @@ if '.' in TABLE:
 
 sql = f"""
 SELECT c.COLUMN_NAME,
-       COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
+       COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY,
+       c.DATA_TYPE,
+       c.CHARACTER_MAXIMUM_LENGTH,
+       c.NUMERIC_PRECISION,
+       c.NUMERIC_SCALE
 FROM INFORMATION_SCHEMA.COLUMNS AS c
 WHERE c.TABLE_NAME = '{table_name}'
   AND c.TABLE_SCHEMA = '{table_schema}'
@@ -76,6 +82,18 @@ cursor.execute(sql)
 rows = cursor.fetchall()
 sql_columns = [row[0] for row in rows]
 identity_columns = {row[0] for row in rows if row[1] == 1}
+
+# Column definitions drive the parameter bindings further down, so the declared
+# precision/scale is read from the table rather than assumed.
+column_meta = {
+    row[0]: {
+        "data_type": (row[2] or "").lower(),
+        "char_len": row[3],
+        "precision": row[4],
+        "scale": row[5],
+    }
+    for row in rows
+}
 
 print(f"Found {len(sql_columns)} SQL columns (identity: {', '.join(identity_columns) if identity_columns else 'none'})")
 
@@ -264,6 +282,59 @@ VALUES
 ({','.join(['?'] * len(insert_columns))})
 """
 
+# ==================================
+# Parameter Bindings
+# ==================================
+# fast_executemany binds one fixed-width buffer per column, so every parameter
+# needs an explicit size. A size of 0 means "use the driver maximum" only for
+# "ODBC Driver 17 for SQL Server"; the legacy "{SQL Server}" driver in conn_str
+# rejects it outright with:
+#   HY104 Invalid precision value (0) (SQLBindParameter)
+# Sizes are therefore read from the table definition and are never 0.
+
+# varchar(max)/nvarchar(max) report CHARACTER_MAXIMUM_LENGTH = -1. The legacy
+# driver cannot bind an unbounded buffer, so those get a fixed width instead.
+MAX_TEXT_BINDING = 4000
+# Columns that are not character types (datetime, date, int, uniqueidentifier)
+# report no length, but their values still arrive as strings for SQL Server to
+# convert. 64 covers the widest rendered form ('YYYY-MM-DD HH:MM:SS.mmm' at 23,
+# a GUID at 36).
+NON_TEXT_BINDING = 64
+
+def text_binding_size(col_name):
+    """Buffer width for a text-bound parameter. Always >= 1, never 0."""
+    meta = column_meta.get(col_name)
+    if meta is None:
+        return MAX_TEXT_BINDING
+    char_len = meta["char_len"]
+    if char_len is None:
+        return NON_TEXT_BINDING
+    if char_len < 0:
+        return MAX_TEXT_BINDING
+    return max(1, min(int(char_len), MAX_TEXT_BINDING))
+
+def decimal_binding(col_name):
+    """(type, precision, scale) for a decimal column, taken from the table."""
+    meta = column_meta.get(col_name) or {}
+    precision = meta.get("precision") or 38
+    scale = meta.get("scale")
+    return (pyodbc.SQL_DECIMAL, min(int(precision), 38), int(scale if scale is not None else 10))
+
+def build_input_sizes(columns, decimal_cols):
+    """Bind true decimal columns as SQL_DECIMAL and everything else as text.
+
+    Mixed text/numeric columns such as configured_purchase_price are absent from
+    decimal_cols on purpose, so they bind as varchar at their declared length and
+    keep values like "N/A" instead of being nulled out.
+    """
+    sizes = []
+    for col_name in columns:
+        if col_name in decimal_cols:
+            sizes.append(decimal_binding(col_name))
+        else:
+            sizes.append((pyodbc.SQL_WVARCHAR, text_binding_size(col_name)))
+    return sizes
+
 for csv_path in csv_paths:
     print(f"Processing: {csv_path}")
     df = read_source_file(csv_path)
@@ -440,49 +511,43 @@ for csv_path in csv_paths:
     try:
         print(f"Inserting {total_rows:,} new rows...")
         cursor.fast_executemany = True
-
-        # Set input sizes for columns that are not numeric. This helps pyodbc's
-        # fast_executemany mode handle None values correctly for string/text columns,
-        # preventing "Invalid string or buffer length" errors.
-        # We define a max length for VARCHAR columns; 0 means "max".
-        # For decimals, we specify a precision (e.g., 38) and scale (e.g., 10).
-        # Mixed text/numeric columns (like configured_purchase_price) are bound as
-        # VARCHAR so both formatted numbers and "N/A" are stored correctly as text.
-        sql_type_map = []
-        for col_name in df.columns:
-            if col_name in cols_to_convert:
-                # Be explicit about decimal types with precision and scale.
-                sql_type_map.append((pyodbc.SQL_DECIMAL, 38, 10))
-            elif col_name in price_text_cols_resolved:
-                # varchar(200) column - bind as wide varchar with an explicit
-                # length matching the SQL column definition.
-                sql_type_map.append((pyodbc.SQL_WVARCHAR, 200))
-            else:
-                # For all other columns, specify as wide varchar with max length.
-                sql_type_map.append((pyodbc.SQL_WVARCHAR, 0))
-        cursor.setinputsizes(sql_type_map)
+        cursor.setinputsizes(build_input_sizes(df.columns, cols_to_convert))
 
         cursor.executemany(insert_sql, data_to_insert)
         conn.commit()
         print(f"Successfully inserted {total_rows:,} rows from {os.path.basename(csv_path)}.")
 
-    except (pyodbc.DataError, pyodbc.ProgrammingError) as e:
+    except pyodbc.Error as e:
+        # pyodbc.Error, not just DataError/ProgrammingError: binding failures
+        # (HY104 and friends) surface as the base class and would otherwise
+        # escape as an unhandled traceback with the transaction left open.
         print(f"Data insertion failed for {os.path.basename(csv_path)}: {e}")
         conn.rollback()
 
-        # Fallback to row-by-row insert to find the problematic record
+        # Fallback to row-by-row insert to find the problematic record.
+        # setinputsizes() persists on the cursor, so it is cleared first - those
+        # bindings are themselves a candidate cause of the failure, and leaving
+        # them in place would break every row in this loop too.
         print("Searching for the problematic row...")
         cursor.fast_executemany = False
+        cursor.setinputsizes(None)
+        failed_row = None
         for i, row in enumerate(data_to_insert):
             try:
                 cursor.execute(insert_sql, row)
-            except (pyodbc.DataError, pyodbc.ProgrammingError) as row_e:
+            except pyodbc.Error as row_e:
+                failed_row = i
                 print(f"--- Error found in CSV {os.path.basename(csv_path)} row {i + 2} ---")
                 print(f"Data: {dict(zip(insert_columns, row))}")
                 print(f"Error Details: {row_e}")
                 break
         # Discard anything the debug loop managed to insert before the failure.
         conn.rollback()
+        if failed_row is None:
+            print(
+                "  Every row inserted cleanly on its own, so the data is fine - the failure"
+                " came from the parameter bindings or from fast_executemany itself."
+            )
 
 # Close DB resources
 cursor.close()
