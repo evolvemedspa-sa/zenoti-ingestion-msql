@@ -11,6 +11,8 @@ env/
 Zenoti/.env
 Zenoti/.venv/
 Zenoti/service_account.json
+Zenoti/dbquery/
+Zenoti/sample csv/
 
 # --- Environment Variables & Secrets ---
 .env

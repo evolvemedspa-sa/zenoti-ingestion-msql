@@ -68,6 +68,13 @@ TABLE_CONFIG = [
         "date_format": "%Y/%m/%d",
     },
     {
+        "table_env": "TABLE_EMPLOYEE_SALES",
+        "date_column": "sale_date",
+        "csv_prefix": "employee_sales",
+        "folder_env": "GDRIVE_FOLDER_EMPLOYEE_SALES",
+        "date_format": "%Y-%m-%d",
+    },
+    {
         "table_env": "TABLE_STOCK_LEDGER",
         "date_column": "transaction_date",
         "csv_prefix": "stock_ledger",
