@@ -86,7 +86,7 @@ def _upload_via_oauth(local_path, folder_id):
     metadata = {"name": filename, "parents": [folder_id]}
     media = MediaFileUpload(local_path, resumable=True)
     result = service.files().create(body=metadata, media_body=media, fields="id,name").execute()
-    print(f"Uploaded to Drive (OAuth fallback): {result['name']} (id: {result['id']})")
+    print(f"Uploaded to Drive (OAuth fallback): {result['name']}")
     return result["id"]
 
 
@@ -134,7 +134,7 @@ def upload_file_to_gdrive(local_path, folder_id, credentials_json=None, credenti
         print(f"Upload failed ({resp.status_code}): {resp.text}")
     resp.raise_for_status()
     result = resp.json()
-    print(f"Uploaded to Drive: {result['name']} (id: {result['id']})")
+    print(f"Uploaded to Drive: {result['name']}")
     return result["id"]
 
 
@@ -156,6 +156,24 @@ def list_csv_filenames(folder_id, credentials_json=None, credentials_file=None):
     return [f["name"] for f in resp.json().get("files", [])]
 
 
+def _folder_label(session, folder_id):
+    """Return the folder's name for log lines, so raw folder IDs stay out of logs.
+
+    Logs are printed to the Railway console and uploaded back to Drive, so the ID
+    should not appear in them. Falls back to a masked ID when the name cannot be
+    read: this is only ever used for logging and must not break an ingest run.
+    """
+    try:
+        resp = session.get(f"{DRIVE_API}/{folder_id}", params={"fields": "name"})
+        resp.raise_for_status()
+        name = resp.json().get("name")
+        if name:
+            return repr(name)
+    except (requests.RequestException, ValueError):
+        pass
+    return f"<unnamed folder ...{str(folder_id)[-4:]}>"
+
+
 def get_csv_from_gdrive(folder_id, credentials_json=None, credentials_file=None):
     """Download all CSV files from a Google Drive folder to a temp directory.
 
@@ -167,6 +185,7 @@ def get_csv_from_gdrive(folder_id, credentials_json=None, credentials_file=None)
     session = _get_authed_session(
         credentials_json=credentials_json, credentials_file=credentials_file
     )
+    folder = _folder_label(session, folder_id)
 
     query = f"'{folder_id}' in parents and mimeType='text/csv' and trashed=false"
     resp = session.get(
@@ -177,7 +196,7 @@ def get_csv_from_gdrive(folder_id, credentials_json=None, credentials_file=None)
     files = resp.json().get("files", [])
 
     if not files:
-        print(f"SKIP: No CSV files found in Google Drive folder: {folder_id}")
+        print(f"SKIP: No CSV files found in Google Drive folder {folder}")
         return None
 
     download_dir = tempfile.mkdtemp(prefix="zenoti_gdrive_")
@@ -191,9 +210,52 @@ def get_csv_from_gdrive(folder_id, credentials_json=None, credentials_file=None)
         with open(local_path, "wb") as fh:
             for chunk in dl_resp.iter_content(chunk_size=8192):
                 fh.write(chunk)
-    print(f"  ● Load       Downloaded {len(files)} file(s) from Google Drive", flush=True)
+    print(f"  ● Load       Downloaded {len(files)} file(s) from Google Drive "
+          f"folder {folder}", flush=True)
 
     if len(files) == 1:
         return os.path.join(download_dir, files[0]["name"])
 
     return download_dir
+
+
+def _demo():
+    """Self-check for _folder_label: never leaks a full folder ID."""
+    folder_id = "1AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+
+    class _Resp:
+        def __init__(self, payload=None, error=None):
+            self._payload, self._error = payload, error
+
+        def raise_for_status(self):
+            if self._error:
+                raise self._error
+
+        def json(self):
+            if self._payload is None:
+                raise ValueError("not json")
+            return self._payload
+
+    class _Session:
+        def __init__(self, resp):
+            self._resp = resp
+
+        def get(self, url, params=None):
+            return self._resp
+
+    ok = _folder_label(_Session(_Resp({"name": "PO and Transfers"})), folder_id)
+    assert ok == "'PO and Transfers'", ok
+
+    for bad in (_Resp(error=requests.RequestException("boom")),
+                _Resp(payload=None),
+                _Resp({})):
+        label = _folder_label(_Session(bad), folder_id)
+        assert folder_id not in label, label
+        assert label == "<unnamed folder ...3456>", label
+
+    print("gdrive_helper self-check OK")
+
+
+if __name__ == "__main__":
+    _demo()
+
