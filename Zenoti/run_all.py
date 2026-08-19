@@ -20,10 +20,19 @@ SCRIPTS = [
     "business_kpi_v2.py",
     "fb_ads.py",
     "google_ads.py",
-    # stock_inventory.py runs last: it appends a full stock snapshot and is the
+    # stock_inventory.py runs late: it appends a full stock snapshot and is the
     # slowest step, so a failure here should not hold up the other loads.
     "stock_inventory.py",
+    # po_and_transfers.py runs last: it loads the order-level CSV and then chains
+    # the Zenoti API pulls for purchase_order.py / transfer_order.py, so it is the
+    # longest step and the only one that depends on a live API.
+    "po_and_transfers.py",
 ]
+
+# Scripts whose failure is logged but does not stop the pipeline or fail the run.
+# Everything before them has already committed, and nothing downstream reads
+# their tables, so there is nothing to protect by aborting.
+NON_BLOCKING = {"po_and_transfers.py"}
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_dir = os.path.join(script_dir, "logs")
@@ -36,6 +45,7 @@ log_path = os.path.join(log_dir, log_filename)
 start_time = datetime.now()
 all_passed = True
 failed_script = None
+failed_non_blocking = []
 
 
 def log(msg):
@@ -75,6 +85,11 @@ for script in SCRIPTS:
     elapsed = (datetime.now() - script_start).total_seconds()
 
     if result.returncode != 0:
+        if script in NON_BLOCKING:
+            log(f"[FAILED] {script} (exit code {result.returncode}, {elapsed:.1f}s) "
+                "- non-blocking, continuing")
+            failed_non_blocking.append(script)
+            continue
         log(f"[FAILED] {script} (exit code {result.returncode}, {elapsed:.1f}s)")
         all_passed = False
         failed_script = script
@@ -84,7 +99,10 @@ for script in SCRIPTS:
 
 total_elapsed = (datetime.now() - start_time).total_seconds()
 
-if all_passed:
+if all_passed and failed_non_blocking:
+    log(f"Pipeline complete with non-blocking failures: "
+        f"{', '.join(failed_non_blocking)}. Total time: {total_elapsed:.1f}s")
+elif all_passed:
     log(f"Pipeline complete. Total time: {total_elapsed:.1f}s")
 else:
     log(f"Pipeline stopped at {failed_script}. Total time: {total_elapsed:.1f}s")
