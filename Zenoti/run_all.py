@@ -17,7 +17,7 @@ SCRIPTS = [
     "memberships.py",
     "employee_sales.py",
     "stock_ledger.py",
-    "business_kpi_v2.py",
+    "business_kpi_v3.py",
     "fb_ads.py",
     "google_ads.py",
     # stock_inventory.py runs late: it appends a full stock snapshot and is the
