@@ -20,6 +20,12 @@ SCRIPTS = [
     "business_kpi_v3.py",
     "fb_ads.py",
     "google_ads.py",
+    # update_zenoti_cohort.py rebuilds the dashboard's customer-spend rollup from
+    # the bronze tables, so it runs after the loads that feed it (cash.py provides
+    # its ZEN leg; the SQ and BLVD legs read closed historical windows that no
+    # pipeline step writes). Server-side INSERT..SELECT, one transaction -- a
+    # failure rolls back and leaves the table as it was.
+    "update_zenoti_cohort.py",
     # stock_inventory.py runs late: it appends a full stock snapshot and is the
     # slowest step, so a failure here should not hold up the other loads.
     "stock_inventory.py",
