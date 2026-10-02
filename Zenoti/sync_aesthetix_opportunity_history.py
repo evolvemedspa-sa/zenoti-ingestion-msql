@@ -133,6 +133,8 @@ DEFAULT_OVERLAP_HOURS = 24
 # accepted. Budget well under the cap instead of at it; --batch-rows overrides.
 PARAM_BUDGET = 1000
 PROGRESS_EVERY = 20
+# How many skipped records to name in the log before summarising the rest.
+MAX_SKIPS_REPORTED = 10
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +272,12 @@ def read_watermark(cursor):
     return cursor.fetchone()[0]
 
 
+def count_rows(cursor, table):
+    """Row count, for the run header."""
+    cursor.execute(f"SELECT COUNT(*) FROM {bracket(table)}")
+    return cursor.fetchone()[0]
+
+
 def duplicate_keys(cursor, table, column):
     """How many opportunity_ids appear more than once in `table` (0 is healthy)."""
     cursor.execute(f"""
@@ -294,15 +302,62 @@ def fetch_source(cursor, since, limit):
     return cursor.fetchall()
 
 
+def _merge_chunk(cursor, table, chunk, extra_cols, extra_vals):
+    """One batched MERGE. Returns (inserted, updated)."""
+    sql = build_merge(table, len(chunk), extra_cols)
+    flat = []
+    for row in chunk:
+        flat.extend(row)
+        flat.extend(extra_vals)
+    cursor.execute(sql, flat)
+    # OUTPUT $action returns one row per affected row; it must be drained or the
+    # next execute (and the count) sees the wrong result set.
+    inserted = updated = 0
+    for (action,) in cursor.fetchall():
+        if action == "INSERT":
+            inserted += 1
+        else:
+            updated += 1
+    return inserted, updated
+
+
+def _merge_row_by_row(cursor, table, chunk, extra_cols, extra_vals):
+    """Retry a failed batch one row at a time. Returns (inserted, updated, bad)."""
+    inserted = updated = 0
+    bad = []
+    for row in chunk:
+        try:
+            ins, upd = _merge_chunk(cursor, table, [row], extra_cols, extra_vals)
+        except pyodbc.Error as e:
+            bad.append((row[0], str(e).splitlines()[0][:200]))
+            continue
+        inserted += ins
+        updated += upd
+    return inserted, updated, bad
+
+
 def merge_rows(cursor, table, rows, batch_rows=None, extra=()):
-    """MERGE the rows in batches. Returns (inserted, updated). No deletes, ever.
+    """MERGE the rows in batches. Returns (inserted, updated, skipped). No deletes.
+
+    `skipped` is a list of (opportunity_id, message) for rows that could not be
+    written, and it is the point of the row-by-row fallback below.
 
     `extra` is the ordered list of sourceless columns being supplied; each row's
     parameters are its mapped values followed by those columns' constants, in the
     same order as the VALUES tuple.
+
+    A batch that fails is retried ONE ROW AT A TIME so a single bad record (a
+    value too long for its column, NULL into a NOT NULL column) is skipped and
+    reported instead of killing the run. Without that, one bad record fails every
+    run forever -- this whole load is one transaction, so nothing commits until
+    the end, and the sync would never make progress on its own.
+
+    Guardrail on the guardrail: if a batch fails AND every row in it fails alone
+    too, the statement is wrong, not the data -- a renamed column, a changed type.
+    That raises rather than skipping the entire source and reporting success.
     """
     if not rows:
-        return 0, 0
+        return 0, 0, []
     extra_cols = list(extra)
     extra_vals = [INSERT_DEFAULTS[c] for c in extra_cols]
     n_cols = len(MAP) + len(extra_cols)
@@ -311,30 +366,37 @@ def merge_rows(cursor, table, rows, batch_rows=None, extra=()):
         raise SystemExit(f"--batch-rows {batch_size} needs {batch_size * n_cols} parameters, "
                          f"over the 2100 SQL Server allows")
     inserted = updated = 0
+    skipped = []
     _t0 = time.monotonic()
 
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
-        sql = build_merge(table, len(chunk), extra_cols)
-        flat = []
-        for row in chunk:
-            flat.extend(row)
-            flat.extend(extra_vals)
-        cursor.execute(sql, flat)
-        # OUTPUT $action returns one row per affected row; it must be drained or
-        # the next execute (and the count) sees the wrong result set.
-        for (action,) in cursor.fetchall():
-            if action == "INSERT":
-                inserted += 1
-            else:
-                updated += 1
+        try:
+            ins, upd = _merge_chunk(cursor, table, chunk, extra_cols, extra_vals)
+        except pyodbc.Error as e:
+            ins, upd, bad = _merge_row_by_row(cursor, table, chunk, extra_cols, extra_vals)
+            # len(chunk) > 1: a one-row batch failing tells you nothing about the
+            # statement, so it is always just a bad row. Only a whole multi-row
+            # batch failing alone is evidence the SQL itself is wrong.
+            if len(chunk) > 1 and len(bad) == len(chunk):
+                raise SystemExit(
+                    f"All {len(chunk):,} row(s) in a batch failed individually too, so the "
+                    f"statement is at fault, not the data:\n  {e}\n"
+                    f"Check that the mapped target columns still exist and their types "
+                    f"still fit; nothing was committed."
+                )
+            print(f"  {len(bad):,} bad row(s) isolated out of a {len(chunk)}-row batch",
+                  flush=True)
+            skipped.extend(bad)
+        inserted += ins
+        updated += upd
 
         done = min(start + batch_size, len(rows))
         if (start // batch_size + 1) % PROGRESS_EVERY == 0 and done < len(rows):
             rate = done / max(time.monotonic() - _t0, 1e-9)
             print(f"  {done:,} / {len(rows):,} merged ({rate:,.0f} rows/s)", flush=True)
 
-    return inserted, updated
+    return inserted, updated, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -432,44 +494,59 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
             origin = "--since"
         elif full:
             since = None
-            origin = "--full"
+            origin = "full read"
         elif watermark is None:
             since = None
-            origin = "target is empty"
+            origin = "first run, target is empty"
         else:
             since = watermark - timedelta(hours=overlap_hours)
-            origin = f"target MAX({TARGET_CURSOR}) {watermark} - {overlap_hours}h overlap"
+            origin = f"last synced {watermark}, -{overlap_hours}h overlap"
 
-        print(f"Source: {bracket(SOURCE_TABLE)} (SQL2)")
-        print(f"Target: {target} (SQL1)")
-        print(f"Delta:  {origin}")
-        print(f"       {SOURCE_CURSOR} >= {since}" if since else "       no filter (every row)")
+        print(f"EVOLVEPBI Records:              {count_rows(src_cur, SOURCE_TABLE):,}")
+        print(f"Aesthetix Opportunity Records:  {count_rows(tgt_cur, TARGET_TABLE):,}")
+        print()
+        if since:
+            print(f"Delta:  {SOURCE_CURSOR} >= {since}   ({origin})")
+        else:
+            print(f"Delta:  {origin} - every record")
 
         _t0 = time.monotonic()
         rows = fetch_source(src_cur, since, limit)
         extra = plan_extras(tgt_cur)
-        if extra:
-            print(f"INSERT-only value(s) for sourceless column(s): "
-                  f"{ {c: INSERT_DEFAULTS[c] for c in extra} }")
-        print(f"\nRead {len(rows):,} source row(s) in {time.monotonic() - _t0:.1f}s", flush=True)
 
         if not rows:
-            print("Nothing to sync - already up to date.")
+            print("\n  Read 0 - nothing new, already up to date.")
             return 0
 
-        inserted, updated = merge_rows(tgt_cur, target, rows, batch_rows, extra)
+        inserted, updated, skipped = merge_rows(tgt_cur, target, rows, batch_rows, extra)
 
         if dry_run:
             tgt_conn.rollback()
-            print(f"\n--dry-run: would insert {inserted:,}, update {updated:,} "
-                  f"of {len(rows):,} row(s). ROLLED BACK - nothing written.")
+            print(f"\n  Read {len(rows):,} - would insert {inserted:,}, "
+                  f"update {updated:,}   (DRY RUN, rolled back - nothing written)")
         else:
             tgt_conn.commit()
-            print(f"\ninserted {inserted:,}, updated {updated:,} "
-                  f"of {len(rows):,} row(s). Committed.")
-            print("(no rows were deleted)")
+            print(f"\n  Read {len(rows):,} - inserted {inserted:,}, "
+                  f"updated {updated:,}   ({time.monotonic() - _t0:.1f}s)")
+        if inserted and extra:
+            print(f"  new record default(s): { {c: INSERT_DEFAULTS[c] for c in extra} } "
+                  f"(no source column)")
+
+        if skipped:
+            print(f"\n  SKIPPED {len(skipped):,} record(s) - could not be written:")
+            for key, msg in skipped[:MAX_SKIPS_REPORTED]:
+                print(f"    {key}: {msg}")
+            if len(skipped) > MAX_SKIPS_REPORTED:
+                print(f"    ... and {len(skipped) - MAX_SKIPS_REPORTED:,} more")
+            print("  The rest of the run committed. Fix the source value or widen the "
+                  "target column, then re-run with --since to retry them.")
+            # Non-zero so a skipped record shows up as a failed run on Railway
+            # rather than scrolling past as a success.
+            return 1
         return 0
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: merge_rows aborts with SystemExit when the
+        # statement itself is wrong, and that transaction still needs rolling back.
         tgt_conn.rollback()
         raise
     finally:
@@ -545,6 +622,52 @@ def self_check():
     wm = datetime(2026, 10, 1, 12, 0, 0)
     assert wm - timedelta(hours=24) == datetime(2026, 9, 30, 12, 0, 0)
 
+    # Guardrail: a batch that fails is retried row by row, so ONE bad record is
+    # skipped rather than failing the whole run. Fake cursor: any statement
+    # containing the poisoned id 999 raises, everything else inserts.
+    blank = (None,) * (len(MAP) - 1)
+    rows = [(1,) + blank, (999,) + blank, (2,) + blank]
+
+    class FakeCursor:
+        def __init__(self):
+            self._result = []
+
+        def execute(self, sql, params=None):
+            params = params or []
+            self._result = []
+            if 999 in params:
+                raise pyodbc.Error("23000", "[23000] String or binary data would be truncated")
+            for _ in range(len(params) // len(MAP)):
+                self._result.append(("INSERT",))
+
+        def fetchall(self):
+            return self._result
+
+    ins, upd, skipped = merge_rows(FakeCursor(), "[dbo].[t]", rows, batch_rows=3, extra=())
+    assert (ins, upd) == (2, 0), (ins, upd)
+    assert len(skipped) == 1 and skipped[0][0] == 999, skipped
+    assert "truncated" in skipped[0][1], skipped[0]
+
+    # Guardrail on the guardrail: when EVERY row in the batch fails alone too, the
+    # statement is at fault (renamed column, changed type) -- abort, do not skip
+    # the whole source and call it a success.
+    class AllBad(FakeCursor):
+        def execute(self, sql, params=None):
+            raise pyodbc.Error("42S22", "[42S22] Invalid column name 'name'")
+
+    try:
+        merge_rows(AllBad(), "[dbo].[t]", rows, batch_rows=3, extra=())
+    except SystemExit as e:
+        assert "not the data" in str(e), e
+        assert "nothing was committed" in str(e), e
+    else:
+        raise AssertionError("a batch where every row fails must abort the run")
+
+    # A single bad row in a single-row batch is still just a skip, not an abort.
+    ins, upd, skipped = merge_rows(FakeCursor(), "[dbo].[t]", [(999,) + blank],
+                                  batch_rows=1, extra=())
+    assert (ins, upd, len(skipped)) == (0, 0, 1), (ins, upd, skipped)
+
     print("self-check OK")
     return 0
 
@@ -609,7 +732,8 @@ def main():
         if batch_rows <= 0:
             raise SystemExit(f"--batch-rows must be positive, got {batch_rows}")
 
-    print("*** DRY RUN - everything runs, then rolls back ***\n" if dry_run else "")
+    if dry_run:
+        print("*** DRY RUN - everything runs, then rolls back ***\n")
     raise SystemExit(run(since, overlap, "--full" in opts, limit, dry_run, batch_rows))
 
 
