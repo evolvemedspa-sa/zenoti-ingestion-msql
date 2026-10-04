@@ -89,6 +89,22 @@ def log(step, msg=""):
     print(f"  ● {step:<10} {msg}", flush=True)
 
 
+def log_rows(step, rows, note=""):
+    """Report a set of rows by NAME, not just by count.
+
+    A bare "4 rows" tells you something is wrong but not what, and the ids are
+    20-character guids that mean nothing at a glance. Both column order and the
+    cap match what the guardrail prints for skipped rows, so the two read alike.
+    """
+    if not rows:
+        return
+    log(step, f"{len(rows):,} row(s) {note}".rstrip())
+    for row in rows[:MAX_SKIPS_REPORTED]:
+        print(f"    {row[0]}  {row[1]}")
+    if len(rows) > MAX_SKIPS_REPORTED:
+        print(f"    ... and {len(rows) - MAX_SKIPS_REPORTED:,} more")
+
+
 # The script sits next to db_helper.py and .env in Zenoti/, so the import above
 # just works and no sys.path juggling is needed.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -615,6 +631,7 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None,
 
         if reconcile:
             rows = fetch_missing(src_cur, tgt_cur, limit)
+            log_rows("Missing", rows, "absent from the target - inserting")
         else:
             rows = fetch_source(src_cur, since, limit)
             if since is not None and limit is None:
@@ -628,8 +645,7 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None,
                 seen = {row[0] for row in rows}
                 late = [row for row in fetch_missing(src_cur, tgt_cur)
                         if row[0] not in seen]
-                if late:
-                    log("Late", f"{len(late):,} row(s) under the window - inserting")
+                log_rows("Late", late, "below the window - inserting")
                 rows += late
         extra = plan_extras(tgt_cur)
 
