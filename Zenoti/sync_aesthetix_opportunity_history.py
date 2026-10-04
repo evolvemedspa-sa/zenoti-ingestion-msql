@@ -27,6 +27,15 @@ source clock that is a little behind. If the target is empty, everything loads.
 
 NOTHING IS EVER DELETED. A row missing from the source keeps its target row.
 
+The one row the window cannot reach is the late arrival. A record read by
+UpdatedAt is invisible to every run whose window starts after that stamp - so a
+source that delivers a backlog late (rows appearing with their original, older
+timestamps) drops them behind the window permanently, however big the overlap
+is. Every ordinary run therefore ALSO does a key pass: it diffs the source's ids
+against the target's and inserts whatever is absent from the target, whatever
+its date. That has no start point to fall behind, so the sync heals itself and
+needs no repair flag. --reconcile is that pass on its own, for an audit.
+
 Column-shape note: the source is the CRM read model (26 CamelCase columns), the
 target is the raw export shape (17). MAP below carries the 14 that line up.
 is_bulk_import, pipeline_stage_id and raw_json have NO source. On rows that
@@ -42,6 +51,7 @@ Usage:
     python sync_aesthetix_opportunity_history.py --limit 1000 --dry-run
     python sync_aesthetix_opportunity_history.py
     python sync_aesthetix_opportunity_history.py --full          # ignore the watermark
+    python sync_aesthetix_opportunity_history.py --reconcile     # insert by key, no date window
     python sync_aesthetix_opportunity_history.py --since 2026-09-01
     python sync_aesthetix_opportunity_history.py --overlap-hours 48
     python sync_aesthetix_opportunity_history.py --self-check
@@ -49,6 +59,9 @@ Usage:
     --check-db      read-only: connect both, report tables, ids, duplicates, the mapping
     --dry-run       run the whole merge in a transaction, print the counts, ROLL BACK
     --full          read every source row (no UpdatedAt filter)
+    --reconcile     read only source keys absent from the target - catches late
+                    arrivals the date window can never reach (cannot combine with
+                    --full/--since, which are date-window modes)
     --since D       explicit watermark start (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')
     --overlap-hours re-read this many hours before the watermark (default 24)
     --limit N       only the newest N source rows - trial run against prod
@@ -143,6 +156,9 @@ DEFAULT_OVERLAP_HOURS = 24
 # request has too many parameters"), where a plain INSERT of the same size is
 # accepted. Budget well under the cap instead of at it; --batch-rows overrides.
 PARAM_BUDGET = 1000
+# Keys per `WHERE key IN (...)` when fetching the rows missing from the target.
+# Same 2100-parameter ceiling applies, so this stays well under it.
+FETCH_CHUNK = 500
 PROGRESS_EVERY = 20
 # How many skipped records to name in the log before summarising the rest.
 MAX_SKIPS_REPORTED = 10
@@ -339,6 +355,42 @@ def fetch_source(cursor, since, limit):
     return cursor.fetchall()
 
 
+def fetch_missing(src_cursor, tgt_cursor, limit=None):
+    """Source rows whose key is absent from the target, whatever their date.
+
+    The date window is what makes a late-arriving row unreachable: rows are read
+    by UpdatedAt, so a record that turns up after the watermark has already
+    passed its own stamp sits below the window and is never read again. A key
+    comparison has no start point, so nothing can fall behind it -- it costs one
+    pass over every key on both sides instead.
+
+    Keys are read on their own first, so the (wide) row fetch only ever covers
+    the handful actually missing rather than the whole table.
+    """
+    cols = ",".join(f"[{s}]" for _t, s in MAP)
+    tgt_cursor.execute(f"SELECT [{KEY_TARGET}] FROM {bracket(TARGET_TABLE)}")
+    have = {row[0] for row in tgt_cursor.fetchall()}
+
+    src_cursor.execute(f"SELECT [{KEY_SOURCE}] FROM {bracket(SOURCE_TABLE)}")
+    missing = [row[0] for row in src_cursor.fetchall() if row[0] not in have]
+    if limit:
+        missing = missing[:int(limit)]
+    if not missing:
+        return []
+
+    rows = []
+    for start in range(0, len(missing), FETCH_CHUNK):
+        chunk = missing[start:start + FETCH_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        src_cursor.execute(
+            f"SELECT {cols} FROM {bracket(SOURCE_TABLE)} "
+            f"WHERE [{KEY_SOURCE}] IN ({marks}) ORDER BY [{SOURCE_CURSOR}]",
+            chunk,
+        )
+        rows.extend(src_cursor.fetchall())
+    return rows
+
+
 def _merge_chunk(cursor, table, chunk, extra_cols, extra_vals):
     """One batched MERGE. Returns (inserted, updated)."""
     sql = build_merge(table, len(chunk), extra_cols)
@@ -516,7 +568,8 @@ def check_db():
         tgt_conn.close()
 
 
-def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
+def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None,
+        reconcile=False):
     _t0 = time.monotonic()
     src_conn = connect(SOURCE_ENV)
     tgt_conn = connect(TARGET_ENV)
@@ -530,7 +583,10 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
 
         watermark = read_watermark(tgt_cur)
 
-        if since_override:
+        if reconcile:
+            since = None
+            origin = "keys absent from the target"
+        elif since_override:
             since = since_override
             origin = "--since"
         elif full:
@@ -550,12 +606,31 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
         tgt_n = count_rows(tgt_cur, TARGET_TABLE)
         log("Source", f"{src_n:,} rows (EVOLVEPBI)")
         log("Target", f"{tgt_n:,} rows (Aesthetix)")
-        if since:
+        if reconcile:
+            log("Delta", origin)
+        elif since:
             log("Delta", f"{SOURCE_CURSOR} >= {since}   ({origin})")
         else:
             log("Delta", f"{origin} - every record")
 
-        rows = fetch_source(src_cur, since, limit)
+        if reconcile:
+            rows = fetch_missing(src_cur, tgt_cur, limit)
+        else:
+            rows = fetch_source(src_cur, since, limit)
+            if since is not None and limit is None:
+                # ...plus whatever the window cannot see. A source that delivers a
+                # backlog late leaves those rows below the watermark for good, so
+                # the key pass is the only thing that reaches them -- and it is
+                # what makes the ordinary run self-healing rather than something
+                # that has to be spotted and repaired with a flag. Skipped when the
+                # window already covers every row (since is None) and on --limit
+                # trials, where the point is to read a handful.
+                seen = {row[0] for row in rows}
+                late = [row for row in fetch_missing(src_cur, tgt_cur)
+                        if row[0] not in seen]
+                if late:
+                    log("Late", f"{len(late):,} row(s) under the window - inserting")
+                rows += late
         extra = plan_extras(tgt_cur)
 
         if not rows:
@@ -739,6 +814,44 @@ def self_check():
                                   batch_rows=1, extra=())
     assert (ins, upd, len(skipped)) == (0, 0, 1), (ins, upd, skipped)
 
+    # --reconcile reads by key, so a late-arriving row has no window to fall
+    # behind. Pin the differencing AND that only the missing keys are ever
+    # fetched -- a fetch without the IN filter would read the whole table.
+    class TargetKeys:
+        def execute(self, sql, params=None):
+            pass
+
+        def fetchall(self):
+            return [("a",), ("b",)]
+
+    class SourceKeys:
+        def __init__(self, ids):
+            self.ids = ids
+            self.result = []
+            self.fetched = []
+
+        def execute(self, sql, params=None):
+            if "WHERE [Id] IN" in sql:
+                self.fetched.extend(params)
+                self.result = [(k,) + blank for k in params]
+            else:
+                self.result = [(k,) for k in self.ids]
+
+        def fetchall(self):
+            return self.result
+
+    src_keys = SourceKeys(["a", "b", "c", "d"])
+    assert [r[0] for r in fetch_missing(src_keys, TargetKeys())] == ["c", "d"]
+    assert src_keys.fetched == ["c", "d"], "only the missing keys may be fetched"
+
+    src_keys = SourceKeys(["a", "b", "c", "d"])
+    assert [r[0] for r in fetch_missing(src_keys, TargetKeys(), limit=1)] == ["c"]
+    assert src_keys.fetched == ["c"], src_keys.fetched
+
+    src_keys = SourceKeys(["a", "b"])
+    assert fetch_missing(src_keys, TargetKeys()) == []
+    assert src_keys.fetched == [], "nothing missing must not trigger a row fetch"
+
     # The Azure serverless cold start a cron actually hits, copied from a real
     # run: SQLSTATE HY000, which is NOT in the transient SQLSTATE set, and the
     # serverless code 40613 buried in the message. The retry only fires if the
@@ -824,9 +937,14 @@ def main():
         if batch_rows <= 0:
             raise SystemExit(f"--batch-rows must be positive, got {batch_rows}")
 
+    reconcile = "--reconcile" in opts
+    if reconcile and ("--full" in opts or since is not None):
+        raise SystemExit("--reconcile reads by key, so --full and --since do not apply")
+
     if dry_run:
         log("Dry run", "no writes - everything runs, then rolls back")
-    raise SystemExit(run(since, overlap, "--full" in opts, limit, dry_run, batch_rows))
+    raise SystemExit(run(since, overlap, "--full" in opts, limit, dry_run, batch_rows,
+                         reconcile))
 
 
 if __name__ == "__main__":
