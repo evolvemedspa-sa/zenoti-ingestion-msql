@@ -63,7 +63,7 @@ from datetime import datetime, timedelta
 import pyodbc
 from dotenv import load_dotenv
 
-from db_helper import pick_odbc_driver
+from db_helper import _is_transient_connect_error, pick_odbc_driver
 
 # The script sits next to db_helper.py and .env in Zenoti/, so the import above
 # just works and no sys.path juggling is needed.
@@ -168,8 +168,34 @@ def build_conn_str(env_names, env=None, driver=None):
 
 
 def connect(env_names):
-    return pyodbc.connect(build_conn_str(env_names),
-                          timeout=int(os.getenv("DB_LOGIN_TIMEOUT", "30")))
+    """Open a connection, retrying transient failures.
+
+    Azure SQL here is serverless: an idle database auto-pauses, and the first
+    connect while it resumes fails with 40613 "is not currently available" plus
+    SQLSTATE HY000. That is a normal cold start, not an outage -- and a cron has
+    nobody to re-run it, so without this one cold start loses a whole cycle.
+
+    Only the error classifier is borrowed from db_helper (its get_connection is
+    left untouched because it reads fixed SERVER/DB_USER names); reusing it keeps
+    the transient list in one place instead of a second copy that drifts.
+    """
+    conn_str = build_conn_str(env_names)
+    login_timeout = int(os.getenv("DB_LOGIN_TIMEOUT", "30"))
+    retries = int(os.getenv("DB_CONNECT_RETRIES", "3"))
+    backoff = float(os.getenv("DB_CONNECT_BACKOFF", "2"))
+    attempt = 0
+    while True:
+        try:
+            return pyodbc.connect(conn_str, timeout=login_timeout)
+        except pyodbc.Error as err:
+            attempt += 1
+            if attempt > retries or not _is_transient_connect_error(err):
+                raise
+            wait = backoff * (2 ** (attempt - 1))
+            sqlstate = err.args[0] if err.args else "?"
+            print(f"  DB connect failed (SQLSTATE {sqlstate}); "
+                  f"retry {attempt}/{retries} in {wait:.0f}s...", flush=True)
+            time.sleep(wait)
 
 
 def split_table(qualified):
@@ -667,6 +693,27 @@ def self_check():
     ins, upd, skipped = merge_rows(FakeCursor(), "[dbo].[t]", [(999,) + blank],
                                   batch_rows=1, extra=())
     assert (ins, upd, len(skipped)) == (0, 0, 1), (ins, upd, skipped)
+
+    # The Azure serverless cold start a cron actually hits, copied from a real
+    # run: SQLSTATE HY000, which is NOT in the transient SQLSTATE set, and the
+    # serverless code 40613 buried in the message. The retry only fires if the
+    # classifier says yes, so pin the exact string.
+    cold_start = pyodbc.Error(
+        "HY000",
+        "[HY000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Database "
+        "'sql-prod-cus-evolve' on server 'sql-prod-cus-evolve.database.windows.net' "
+        "is not currently available.  Please retry the connection later.  If the "
+        "problem persists, contact customer support, and provide them the session "
+        "tracing ID of '{B906D933-8EC2-48D0-AE94-7C1507979CDB}'. (40613) "
+        "(SQLDriverConnect)")
+    assert _is_transient_connect_error(cold_start), "40613 must be retried"
+
+    # And a real failure must NOT be retried -- retrying a bad password or a
+    # firewall block just burns backoff time before the same error.
+    assert not _is_transient_connect_error(
+        pyodbc.Error("28000", "[28000] Login failed for user 'sync_user'"))
+    assert not _is_transient_connect_error(
+        pyodbc.Error("08004", "[08004] Server rejected the connection"))
 
     print("self-check OK")
     return 0
