@@ -65,6 +65,17 @@ from dotenv import load_dotenv
 
 from db_helper import _is_transient_connect_error, pick_odbc_driver
 
+# The log line carries '●' (U+25CF). A Windows console defaults to cp1252 and
+# raises UnicodeEncodeError on it, so pin stdout to UTF-8 -- the same line then
+# works on the dev box and on Linux in Railway.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+def log(step, msg=""):
+    print(f"  ● {step:<10} {msg}", flush=True)
+
+
 # The script sits next to db_helper.py and .env in Zenoti/, so the import above
 # just works and no sys.path juggling is needed.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -193,8 +204,8 @@ def connect(env_names):
                 raise
             wait = backoff * (2 ** (attempt - 1))
             sqlstate = err.args[0] if err.args else "?"
-            print(f"  DB connect failed (SQLSTATE {sqlstate}); "
-                  f"retry {attempt}/{retries} in {wait:.0f}s...", flush=True)
+            log("Retry", f"DB connect failed (SQLSTATE {sqlstate}); "
+                         f"{attempt}/{retries} in {wait:.0f}s...")
             time.sleep(wait)
 
 
@@ -411,8 +422,8 @@ def merge_rows(cursor, table, rows, batch_rows=None, extra=()):
                     f"Check that the mapped target columns still exist and their types "
                     f"still fit; nothing was committed."
                 )
-            print(f"  {len(bad):,} bad row(s) isolated out of a {len(chunk)}-row batch",
-                  flush=True)
+            log("Retry", f"{len(bad):,} bad row(s) isolated out of a "
+                         f"{len(chunk)}-row batch")
             skipped.extend(bad)
         inserted += ins
         updated += upd
@@ -420,7 +431,7 @@ def merge_rows(cursor, table, rows, batch_rows=None, extra=()):
         done = min(start + batch_size, len(rows))
         if (start // batch_size + 1) % PROGRESS_EVERY == 0 and done < len(rows):
             rate = done / max(time.monotonic() - _t0, 1e-9)
-            print(f"  {done:,} / {len(rows):,} merged ({rate:,.0f} rows/s)", flush=True)
+            log("Merge", f"{done:,} / {len(rows):,} rows ({rate:,.0f} rows/s)")
 
     return inserted, updated, skipped
 
@@ -506,12 +517,16 @@ def check_db():
 
 
 def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
+    _t0 = time.monotonic()
     src_conn = connect(SOURCE_ENV)
     tgt_conn = connect(TARGET_ENV)
     try:
         src_cur = src_conn.cursor()
         tgt_cur = tgt_conn.cursor()
         target = bracket(TARGET_TABLE)
+
+        log("Connect", "source EVOLVEPBI (read-only)")
+        log("Connect", "target Aesthetix")
 
         watermark = read_watermark(tgt_cur)
 
@@ -528,47 +543,77 @@ def run(since_override, overlap_hours, full, limit, dry_run, batch_rows=None):
             since = watermark - timedelta(hours=overlap_hours)
             origin = f"last synced {watermark}, -{overlap_hours}h overlap"
 
-        print(f"EVOLVEPBI Records:              {count_rows(src_cur, SOURCE_TABLE):,}")
-        print(f"Aesthetix Opportunity Records:  {count_rows(tgt_cur, TARGET_TABLE):,}")
-        print()
+        # Snapshot before the merge. tgt_n is what the post-merge line reports the
+        # change against, and the source/target difference is how a record that
+        # fell behind the sync window shows up.
+        src_n = count_rows(src_cur, SOURCE_TABLE)
+        tgt_n = count_rows(tgt_cur, TARGET_TABLE)
+        log("Source", f"{src_n:,} rows (EVOLVEPBI)")
+        log("Target", f"{tgt_n:,} rows (Aesthetix)")
         if since:
-            print(f"Delta:  {SOURCE_CURSOR} >= {since}   ({origin})")
+            log("Delta", f"{SOURCE_CURSOR} >= {since}   ({origin})")
         else:
-            print(f"Delta:  {origin} - every record")
+            log("Delta", f"{origin} - every record")
 
-        _t0 = time.monotonic()
         rows = fetch_source(src_cur, since, limit)
         extra = plan_extras(tgt_cur)
 
         if not rows:
-            print("\n  Read 0 - nothing new, already up to date.")
+            log("Read", "0 rows - already up to date")
+            log("Insert", "0 rows")
+            log("Failed", "0 rows")
+            log("Done", f"{time.monotonic() - _t0:.1f}s")
             return 0
 
         inserted, updated, skipped = merge_rows(tgt_cur, target, rows, batch_rows, extra)
+        # Counted on this connection BEFORE the commit: it sees its own writes, so
+        # this is the target's size after the merge, which is the whole point of
+        # the line. Skipped for --dry-run, where nothing is real.
+        tgt_after = None if dry_run else count_rows(tgt_cur, TARGET_TABLE)
 
         if dry_run:
             tgt_conn.rollback()
-            print(f"\n  Read {len(rows):,} - would insert {inserted:,}, "
-                  f"update {updated:,}   (DRY RUN, rolled back - nothing written)")
         else:
             tgt_conn.commit()
-            print(f"\n  Read {len(rows):,} - inserted {inserted:,}, "
-                  f"updated {updated:,}   ({time.monotonic() - _t0:.1f}s)")
-        if inserted and extra:
-            print(f"  new record default(s): { {c: INSERT_DEFAULTS[c] for c in extra} } "
-                  f"(no source column)")
 
+        log("Read", f"{len(rows):,} rows")
+        if dry_run:
+            log("Insert", f"{inserted:,} rows   (DRY RUN - nothing written)")
+            log("Update", f"{updated:,} rows   (DRY RUN - nothing written)")
+        else:
+            log("Insert", f"{inserted:,} rows")
+            log("Update", f"{updated:,} rows")
+            change = tgt_after - tgt_n
+            gap = src_n - tgt_after
+            if gap > 0:
+                # Behind means source records sitting OLDER than the sync window.
+                # The incremental run only looks forward from the watermark and
+                # will never reach them; --full reads every source row.
+                gap_txt = f"{gap:,} not in the target - run --full to pull them in"
+            elif gap < 0:
+                gap_txt = f"{-gap:,} more than EVOLVEPBI (nothing is ever deleted)"
+            else:
+                gap_txt = "in sync"
+            log("Target", f"{tgt_after:,} rows   "
+                          f"({'+' if change > 0 else ''}{change:,}, {gap_txt})")
+        if inserted and extra:
+            log("Default", f"{ {c: INSERT_DEFAULTS[c] for c in extra} } "
+                           f"(no source column)")
+
+        log("Failed", f"{len(skipped):,} rows")
         if skipped:
-            print(f"\n  SKIPPED {len(skipped):,} record(s) - could not be written:")
+            print("    could not be written:")
             for key, msg in skipped[:MAX_SKIPS_REPORTED]:
                 print(f"    {key}: {msg}")
             if len(skipped) > MAX_SKIPS_REPORTED:
                 print(f"    ... and {len(skipped) - MAX_SKIPS_REPORTED:,} more")
-            print("  The rest of the run committed. Fix the source value or widen the "
-                  "target column, then re-run with --since to retry them.")
+            print("    the rest of the run committed; fix the source value or widen "
+                  "the target column, then re-run with --since to retry them")
             # Non-zero so a skipped record shows up as a failed run on Railway
             # rather than scrolling past as a success.
+            log("Done", f"{time.monotonic() - _t0:.1f}s")
             return 1
+        log("Done", f"{time.monotonic() - _t0:.1f}s")
         return 0
     except BaseException:
         # BaseException, not Exception: merge_rows aborts with SystemExit when the
@@ -780,7 +825,7 @@ def main():
             raise SystemExit(f"--batch-rows must be positive, got {batch_rows}")
 
     if dry_run:
-        print("*** DRY RUN - everything runs, then rolls back ***\n")
+        log("Dry run", "no writes - everything runs, then rolls back")
     raise SystemExit(run(since, overlap, "--full" in opts, limit, dry_run, batch_rows))
 
 
