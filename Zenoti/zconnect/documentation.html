@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zconnect — script reference</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0;
+    --code-bg: #f6f8fa; --accent: #0969da; --warn-bg: #fff8c5; --warn-line: #d4a72c;
+    --note-bg: #ddf4ff; --note-line: #54aeff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; max-width: 60rem; padding: 2.5rem 1.5rem 6rem;
+    font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg); background: var(--bg);
+  }
+  h1 { font-size: 1.9rem; margin: 0 0 .3rem; }
+  h2 {
+    font-size: 1.3rem; margin: 3rem 0 .9rem; padding-bottom: .3rem;
+    border-bottom: 1px solid var(--line);
+  }
+  h3 { font-size: 1.05rem; margin: 1.9rem 0 .6rem; }
+  h4 { font-size: .95rem; margin: 1.3rem 0 .4rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  p { margin: .6rem 0; }
+  a { color: var(--accent); }
+  code {
+    font-family: "Cascadia Code", Consolas, "SF Mono", monospace; font-size: .88em;
+    background: var(--code-bg); padding: .15em .35em; border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: .85rem 1rem; overflow-x: auto; margin: .7rem 0;
+  }
+  pre code { background: none; padding: 0; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--line); padding: .5rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  td code { white-space: nowrap; }
+  .lede { color: var(--muted); font-size: 1.05rem; margin-bottom: 1.8rem; }
+  .callout { border-left: 4px solid; border-radius: 4px; padding: .7rem .95rem; margin: .9rem 0; font-size: .94rem; }
+  .callout.warn { background: var(--warn-bg); border-color: var(--warn-line); }
+  .callout.note { background: var(--note-bg); border-color: var(--note-line); }
+  .callout strong { display: block; margin-bottom: .2rem; }
+  .files { list-style: none; padding: 0; }
+  .files li { padding: .3rem 0; border-bottom: 1px solid var(--code-bg); }
+  .files code { font-size: .9rem; }
+  .files span { color: var(--muted); }
+  footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+
+<h1>zconnect</h1>
+<p class="lede">Python scripts that pull HyperConnect (formerly ZConnect) reporting data out of Zenoti and write it to CSV.</p>
+
+<h2>Two hosts, two credentials</h2>
+<p>Everything here talks to one of two hosts. They are not interchangeable — each rejects the other's credential.</p>
+<table>
+  <tr><th>Host</th><th>Auth header</th><th>Credential from</th><th>Serves</th></tr>
+  <tr>
+    <td><code>api.zenoti.com</code></td>
+    <td><code>Authorization: apikey &lt;KEY&gt;</code></td>
+    <td><code>ZENOTI_API_KEY</code></td>
+    <td>ZConnect REST routes under <code>/v1/zconnect/</code></td>
+  </tr>
+  <tr>
+    <td><code>hyperconnectapi.zenoti.com</code></td>
+    <td><code>Authorization: Bearer &lt;TOKEN&gt;</code></td>
+    <td><code>HC_TOKEN</code></td>
+    <td><code>/features/v1/</code>, <code>/dashboard/</code>, <code>/recording/</code></td>
+  </tr>
+</table>
+
+<h4>Which script uses which credential</h4>
+<table>
+  <tr>
+    <th>Script</th>
+    <th>ZENOTI_API_KEY</th>
+    <th>HC_TOKEN</th>
+    <th>Live calls made to</th>
+  </tr>
+  <tr>
+    <td><code>events.py</code></td>
+    <td>required</td><td>not used</td>
+    <td><code>api.zenoti.com</code> only</td>
+  </tr>
+  <tr>
+    <td><code>usage_data.py</code></td>
+    <td>required</td><td>not used</td>
+    <td><code>api.zenoti.com</code> only</td>
+  </tr>
+  <tr>
+    <td><code>feedback_metrics.py</code></td>
+    <td>required</td><td>not used</td>
+    <td><code>api.zenoti.com</code> only</td>
+  </tr>
+  <tr>
+    <td><code>call_logs.py</code></td>
+    <td>required</td><td>required</td>
+    <td>both — see note</td>
+  </tr>
+  <tr>
+    <td><code>agent_metrics.py</code></td>
+    <td>required</td><td>required</td>
+    <td>both — see note</td>
+  </tr>
+  <tr>
+    <td><code>location_performance.py</code></td>
+    <td>required</td><td>required</td>
+    <td>both — see note</td>
+  </tr>
+</table>
+<p><strong>Both</strong> means the script signs in twice, for different reasons:</p>
+<ul>
+  <li><strong>ZENOTI_API_KEY is required even by the HyperConnect scripts.</strong> <code>_client.py</code> refuses to import without it — <code>ZENOTI_API_KEY is missing. Add it to your .env file.</code> — so a missing key breaks every script, including ones that never call <code>api.zenoti.com</code> for data. <em>(The resolution: everything shares one module.)</em></li>
+  <li><strong><code>agent_metrics.py</code></strong> calls <code>list_centers()</code> on <code>api.zenoti.com</code> on every run, to get center names and to iterate centers one at a time — that route takes a singular <code>center_id</code>.</li>
+  <li><strong><code>call_logs.py</code></strong> and <strong><code>location_performance.py</code></strong> only reach the Zenoti host when <code>--center-id</code> is given as a <em>code</em> like <code>BEL</code>, which must be resolved to a UUID. Given a UUID, or nothing at all, they talk to the HyperConnect host alone.</li>
+</ul>
+<div class="callout note">
+  <strong>The two credentials are not interchangeable</strong>
+  The <code>HC_TOKEN</code> bearer also happens to work on <code>api.zenoti.com</code> — it opens <code>/v1/reports</code>, which the apikey is refused. But the apikey does <em>not</em> work on the HyperConnect host: seven header forms and a query parameter were all rejected with <code>401</code>. HyperConnect has no login or refresh route, so <code>HC_TOKEN</code> must be pasted by hand and re-pasted when it expires.
+</div>
+<div class="callout warn">
+  <strong>HC_TOKEN expires</strong>
+  It is a dashboard session token, not an API key, and the apikey cannot replace it. To refresh: open the HyperConnect dashboard, press F12 &rarr; Network &rarr; Fetch/XHR, pick any <code>hcreports</code> call, copy the value after <code>Bearer </code> from the <code>authorization</code> request header, and paste it into <code>.env</code>. Single-quote the value — it contains <code>$</code> and <code>|</code>, which break <code>.env</code> parsing otherwise.
+</div>
+
+<h2>Quick start</h2>
+<pre><code>Activate: .venv\Scripts\Activate.ps1
+Run:      python zconnect\events.py</code></pre>
+<p>Run any script with no arguments and it fetches <em>every</em> center, for the date range in <code>.env</code> (or the last 7 days if unset), and writes a CSV named after the range.</p>
+
+<h2>Scripts</h2>
+<table>
+  <tr><th>Script</th><th>Endpoint</th><th>Credential</th><th>Output</th></tr>
+  <tr>
+    <td><a href="#events"><code>events.py</code></a></td>
+    <td><code>GET /v1/zconnect/centers/{id}/events</code></td>
+    <td>apikey</td>
+    <td>One row per timeline event</td>
+  </tr>
+  <tr>
+    <td><a href="#usage"><code>usage_data.py</code></a></td>
+    <td><code>GET /v1/zconnect/financial/usage_data</code></td>
+    <td>apikey</td>
+    <td>One row per center per day (messaging)</td>
+  </tr>
+  <tr>
+    <td><a href="#feedback"><code>feedback_metrics.py</code></a></td>
+    <td><code>GET /v1/zconnect/centers/{id}/feedbacks/metrics</code></td>
+    <td>apikey</td>
+    <td>One row per center per day (review counts)</td>
+  </tr>
+  <tr>
+    <td><a href="#calllogs"><code>call_logs.py</code></a></td>
+    <td><code>POST /features/v1/hcreports/call_logs</code></td>
+    <td>Bearer + apikey</td>
+    <td>One row per call, or an agent/center rollup</td>
+  </tr>
+  <tr>
+    <td><a href="#agents"><code>agent_metrics.py</code></a></td>
+    <td><code>POST /dashboard/fetch_all_agent_data</code></td>
+    <td>Bearer + apikey</td>
+    <td>One row per agent (the Agent Metrics screen)</td>
+  </tr>
+  <tr>
+    <td><a href="#locations"><code>location_performance.py</code></a></td>
+    <td><code>POST /dashboard/fetch_centers_performance</code></td>
+    <td>Bearer + apikey</td>
+    <td>One row per center (the Location performance screen)</td>
+  </tr>
+</table>
+<p><code>_client.py</code> is not run directly — it is the shared library every script imports. See <a href="#client">Shared client</a>.</p>
+
+<h2 id="common">Common behaviour</h2>
+
+<h4>Flags every script shares</h4>
+<table>
+  <tr><th>Flag</th><th>Meaning</th></tr>
+  <tr><td><code>--center-id</code></td><td>Narrow to one center. Accepts a UUID or a center code like <code>BEL</code>. <strong>Omit it and you get every center</strong> — that is the default, not an opt-in.</td></tr>
+  <tr><td><code>--start-date</code> / <code>--end-date</code></td><td><code>YYYY-MM-DD</code>. Fall back to <code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code>, then to the last 7 days.</td></tr>
+  <tr><td><code>--csv</code></td><td>Output path. Each script has its own sensible default.</td></tr>
+</table>
+
+<div class="callout note">
+  <strong>ZENOTI_CENTER_ID does not narrow anything</strong>
+  It is deliberately ignored by the center resolver. With it set in <code>.env</code>, a bare run would otherwise fetch one center and look complete — exactly the silent-truncation failure worth avoiding. Only an explicit <code>--center-id</code> narrows.
+</div>
+
+<h4>Date windows are chunked automatically</h4>
+<p>Each route rejects a window wider than its cap, so scripts split longer ranges and stitch the results. You can always ask for any range.</p>
+<table>
+  <tr><th>Route</th><th>Widest window</th></tr>
+  <tr><td>ZConnect events</td><td>10 days</td></tr>
+  <tr><td>ZConnect usage data</td><td>32 days</td></tr>
+  <tr><td>ZConnect feedback metrics</td><td>185 days</td></tr>
+  <tr><td>HyperConnect call logs</td><td>31 days</td></tr>
+  <tr><td>HyperConnect dashboard routes</td><td>no cap observed (365 days fine)</td></tr>
+</table>
+
+<h4>Failures are retried, then reported</h4>
+<p>Throttled responses (<code>403</code> <em>or</em> <code>429</code> — Zenoti uses both) and hung connections are retried with exponential backoff before a script gives up. Tuning lives in <code>.env</code>: <code>ZENOTI_MAX_RETRIES</code>, <code>ZENOTI_RETRY_BACKOFF</code>, <code>ZENOTI_REQUEST_DELAY</code>.</p>
+
+<hr>
+
+<h2 id="events">events.py</h2>
+<pre><code>GET /v1/zconnect/centers/{center_id}/events</code></pre>
+<p>Appointments, feedback, bot interactions and other centre activity, newest first.</p>
+
+<h4>Fields (18)</h4>
+<p><code>guest_id, guest_name, mobilephone, event_id, action_type, source, send_date, reference_id_1, reference_id_2, old_value, new_value, metadata, profile_image, centerid, center_name, category_type, unread, channel_medium</code></p>
+<p>All 18 columns are always written, even when a field is blank on every row — the field list is held explicitly rather than inferred from what the API happened to return.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><td><code>--filter feedback</code></td><td>Narrow to the feedback feed (<code>category_type 5</code>). Unrecognised values are ignored by the API.</td></tr>
+  <tr><td><code>--expand-metadata</code></td><td>Spread the <code>metadata</code> JSON into <code>metadata_&lt;key&gt;</code> columns.</td></tr>
+  <tr><td><code>--size</code></td><td>Records per page (default 200).</td></tr>
+  <tr><td><code>--max-pages</code></td><td>Page cap per chunk (default 50). Prints a warning if it truncates.</td></tr>
+</table>
+
+<h4>The metadata field</h4>
+<p><code>metadata</code> is a JSON string holding an array of objects, and its shape depends on <code>category_type</code>. Four have been observed:</p>
+<ul>
+  <li>a bare marker — <code>{"ItemType": n}</code></li>
+  <li>a call record — <code>guest_name</code>, <code>guest_phone_number</code>, <code>conference_name</code>, <code>outbound_recording</code>, <code>is_international</code></li>
+  <li>a guest/CRM block — <code>InvoiceId</code>, <code>MobilePhone</code>, <code>GuestReferralCode</code>, center address fields, <code>Opt-OutKeyword</code></li>
+  <li>an appointment block — <code>AppGroupId</code>, <code>StartTime</code>, <code>TreatmentList</code>, <code>AppCost</code></li>
+</ul>
+<p>By default it is written through verbatim. With <code>--expand-metadata</code> each object becomes its own row with its keys spread as <code>metadata_&lt;key&gt;</code>, so an event carrying three objects produces three rows, distinguished by <code>metadata_index</code>. Expect a wide, sparse file — that is the honest shape of a polymorphic field.</p>
+
+<pre><code>python zconnect\events.py --start-date 2026-09-01 --end-date 2026-09-30 --expand-metadata
+# -> zconnect_events_all_meta_2026-09-01_2026-09-30.csv</code></pre>
+
+<hr>
+
+<h2 id="usage">usage_data.py</h2>
+<pre><code>GET /v1/zconnect/financial/usage_data?center_id=..&amp;channel=..&amp;start_date=..&amp;end_date=..</code></pre>
+<p>Messaging usage per day for each center.</p>
+
+<h4>Fields (10)</h4>
+<p><code>date, total_sent_count, twoway_count, mms_count, notification_count, marketing_count, incoming_count, total_segments, outbound_segments, inbound_segments</code></p>
+<p>Rows are tagged with <code>center_id</code> and <code>center_name</code>, which the response itself does not carry.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><td><code>--channel</code></td><td>e.g. <code>SMS</code>. Omit for all. Only channels a center actually uses return data.</td></tr>
+</table>
+<div class="callout note">
+  <strong>center_id is mandatory on this route</strong>
+  Without it the API answers <code>CT026</code>. Because it cannot be sent as a list, the all-centers default is a loop — one request per center per chunk.
+</div>
+
+<hr>
+
+<h2 id="feedback">feedback_metrics.py</h2>
+<pre><code>GET /v1/zconnect/centers/{center_id}/feedbacks/metrics</code></pre>
+<p>Review counts per day, per center.</p>
+
+<h4>Fields</h4>
+<p><code>date, total_reviews, total_replies</code>, plus a nested <code>ratings</code> array which is flattened into <code>rating_1_count</code> … <code>rating_5_count</code> so the file stays one row per date. Rows are tagged with <code>center_id</code> and <code>center_name</code>.</p>
+
+<hr>
+
+<h2 id="calllogs">call_logs.py</h2>
+<pre><code>POST /features/v1/hcreports/call_logs</code></pre>
+<p>One row per call. The Agent Metrics and Location performance screens are aggregations of this same data, though the dedicated dashboard routes below supersede the rollups here for those two views.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><td><code>--by raw</code></td><td>Default. One row per call.</td></tr>
+  <tr><td><code>--by agent</code></td><td>Rollup per agent: calls, made, received, analyzed, sentiment counts, average duration.</td></tr>
+  <tr><td><code>--by center</code></td><td>Rollup per center.</td></tr>
+  <tr><td><code>--page-size</code></td><td>Calls per page, max 200 (larger values silently clamp).</td></tr>
+</table>
+
+<h4>How the numbers map to the screen</h4>
+<table>
+  <tr><th>Screen metric</th><th>Derivation</th></tr>
+  <tr><td>calls</td><td>every row</td></tr>
+  <tr><td>calls made</td><td><code>call_type == 1</code> (outbound)</td></tr>
+  <tr><td>calls received</td><td><code>call_type == 0</code> (inbound)</td></tr>
+  <tr><td>calls analyzed</td><td><code>sentiment is not None</code> — <em>not</em> <code>transcription_status</code></td></tr>
+  <tr><td>positive / negative / neutral</td><td>the <code>sentiment</code> value</td></tr>
+</table>
+<p><code>call_type == 2</code> is neither made nor received — it is the bulk of the agent-less rows (voicebot / missed) and counts toward <code>calls</code> only.</p>
+
+<h4>Timestamps</h4>
+<p>The API sends <code>timestamp</code> as <strong>epoch milliseconds in UTC</strong> — <code>1792007181000</code> is <code>1792007181</code> seconds, i.e. <code>2026-10-14 19:46:21 UTC</code>. A spreadsheet renders that as <code>1.79201E+12</code>: unreadable, and wrong by seconds if the displayed text is copied back out.</p>
+<p>So the raw pull <strong>replaces that column with two ISO text columns</strong>, which Excel leaves alone:</p>
+<pre><code>timestamp_utc        timestamp_local
+2026-10-14 19:46:21  2026-10-14 15:46:21</code></pre>
+<p>Nothing is lost — <code>timestamp_utc</code> carries the same instant the integer did, and the pair sits in the position <code>timestamp</code> occupied. A value that will not parse keeps its original <code>timestamp</code> rather than becoming a guessed date.</p>
+<p>The local column uses a <code>-04:00</code> offset, which is where every centre in this org sits. Point this at another timezone and set <code>HC_UTC_OFFSET</code> to match. The rollups (<code>--by agent</code> / <code>--by center</code>) aggregate the timestamp away, so these columns appear on raw pulls only.</p>
+<div class="callout note">
+  <strong>Center coverage</strong>
+  With no <code>--center-id</code> this sends an empty <code>center_ids</code> list, which the route reads as "every center" — all 15 HyperConnect-active locations, including Scarsdale, NY. Scarsdale serves calls but is absent from <code>/v1/centers</code>, so filtering by that list would miss it.
+</div>
+
+<hr>
+
+<h2 id="agents">agent_metrics.py</h2>
+<pre><code>POST /dashboard/fetch_all_agent_data</code></pre>
+<p>The Agent Metrics screen: call totals, average rating, average time to answer, average call duration and sentiment, <strong>one row per agent per day</strong>. These columns cannot be derived from call logs — <code>guest_rating</code> is null on every call row and time-to-answer does not exist there.</p>
+<p>Daily is not a flag: the request always sends <code>day_wise: true</code>. The client asked for day grain because the dashboards roll days up to a month or a fortnight themselves, and a windowed total cannot be split back into days.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><td><code>--call-mode</code></td><td>Filters which agents appear. Unset (the default) returns everything.</td></tr>
+</table>
+<table>
+  <tr><th><code>--call-mode</code></th><th>Agents over a fortnight</th></tr>
+  <tr><td>unset / <code>2</code> / <code>null</code></td><td>73 — the default</td></tr>
+  <tr><td><code>1</code></td><td>59 — what the dashboard sends, i.e. the on-screen view</td></tr>
+  <tr><td><code>0</code></td><td>14</td></tr>
+</table>
+<p><code>call_mode</code> changes <em>which agents appear</em>, not their values — an agent present in both cuts reports the same numbers.</p>
+
+<h4>Date columns</h4>
+<p><code>start_date</code>, <code>end_date</code> and <code>date</code> all carry the row's own day, not the window that was asked for — every row covers exactly one day. That keeps the table's key exact at day grain, so a lookback run rewrites the day instead of stacking a second overlapping window on top of it. An agent with no calls that day is simply absent from the pull.</p>
+<p>Day-wise rows and the aggregate row do not agree exactly: over one fortnight the day-wise rows summed to 499 calls where the aggregate reported 495. The daily column is what the table holds.</p>
+
+<div class="callout warn">
+  <strong>Traps</strong>
+  <code>center_id</code> is singular here — sending a list raises a DynamoDB ValidationException that reads like a server fault. Dates are <code>YYYYMMDD</code> <em>integers</em>: an ISO string dies with <code>invalid literal for int() with base 10</code>, and an epoch timestamp parses happily but matches nothing, returning an empty list rather than an error. A narrow window also returns nothing rather than erroring, so give it room.
+</div>
+<p>This is the one script that walks the <code>/v1/centers</code> list rather than HyperConnect's, because it must call each center individually. Scarsdale, NY is absent from that list; it has returned 0 agents over a 365-day window, so nothing is currently lost.</p>
+
+<hr>
+
+<h2 id="locations">location_performance.py</h2>
+<pre><code>POST /dashboard/fetch_centers_performance</code></pre>
+<p>The Location performance screen: overall rating, flagged negative calls, SmartBot appointments and revenue, AI receptionist booking revenue and Google rating, <strong>one row per center per day</strong>.</p>
+<p>This route has no day-wise switch — it answers per-center totals for whatever range it is given — so daily rows come from asking one day at a time: one call returns every center, so a seven-day lookback costs seven calls. Verified 2026-10-17: three days pulled one at a time and summed match the same three days asked for as one window, per additive field (negative calls 10 = 10, appointments 1 = 1). Averages do not add, and should not — each row carries its own day's <code>overall_rating</code>.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><td><code>--sort-by</code></td><td><code>overall_rating</code> (default), <code>sb_revenue</code>, <code>total_negative_calls</code>, <code>sb_total_appointments</code>, <code>google_rating</code></td></tr>
+  <tr><td><code>--sort-order</code></td><td><code>desc</code> (default) or <code>asc</code></td></tr>
+  <tr><td><code>--top</code></td><td>Keep only the first N rows after sorting, per day.</td></tr>
+  <tr><td><code>--page-size</code></td><td>Rows per page, capped at 15 server-side.</td></tr>
+  <tr><td><code>--org</code></td><td>Also pull the org-level KPI cards.</td></tr>
+  <tr><td><code>--timeseries</code></td><td>Also pull the org call-volume chart.</td></tr>
+</table>
+<p><code>start_date</code> and <code>end_date</code> are both the row's own day, so a row reads the same however wide the window was and the table's key <code>(center_id, start_date, end_date)</code> stays exact at day grain.</p>
+<p>The route's rollups lag, and the newest day is often missing because of it: on 2026-10-17 a pull covering Oct 16–17 returned nothing for both days, while <code>agent_metrics</code> already had Oct 16 — and the org call-volume chart agreed with this route, not with the agent one. So a deployed run can find T-1 empty and pick that day up on the next run instead. That is what the lookback is for, and an empty day is a no-op: the loader deletes only the keys it was handed, so a day with no rows leaves the day already in the table untouched.</p>
+
+<h4>Two extra routes on the same screen</h4>
+<table>
+  <tr>
+    <th>Flag</th><th>Endpoint</th><th>Output columns</th>
+  </tr>
+  <tr>
+    <td><code>--org</code></td>
+    <td><code>POST /dashboard/fetch_org_performance</code></td>
+    <td><code>metric, curr, prev</code> — active locations, Google rating, SmartBot revenue, AI receptionist revenue, negative calls flagged, plus flat call-category and feature counts</td>
+  </tr>
+  <tr>
+    <td><code>--timeseries</code></td>
+    <td><code>POST /dashboard/fetch_org_level_call_volume_timeseries_plot</code></td>
+    <td><code>date, incoming_calls, outgoing_calls, missed_calls</code></td>
+  </tr>
+</table>
+
+<div class="callout note">
+  <strong>15 rows is the whole set, not a truncated page</strong>
+  <code>page_size</code> clamps at 15 server-side, and that 15 is everything: the org reports exactly 15 <code>active_locations</code>, and this route returns those same 15. The <code>next_token</code> it returns is not a cursor — feeding it back returns an empty page, so it is ignored rather than looped over.
+</div>
+<p>Note the date format here is the opposite of the agent routes: ISO strings, not <code>YYYYMMDD</code> integers. The two <code>/dashboard</code> handlers were written differently.</p>
+
+<hr>
+
+<h2 id="client">Shared client — _client.py</h2>
+<p>Import target for every script. Provides the session, retry logic, the date-chunking helper, the CSV writer, and both error conventions.</p>
+
+<h4>Helpers</h4>
+<table>
+  <tr><th>Function</th><th>Purpose</th></tr>
+  <tr><td><code>get(path, **params)</code></td><td>GET against <code>api.zenoti.com</code>; params left as <code>None</code> are dropped.</td></tr>
+  <tr><td><code>post(path, body)</code></td><td>POST against <code>api.zenoti.com</code>.</td></tr>
+  <tr><td><code>hc_post(path, body)</code></td><td>POST against <code>hyperconnectapi.zenoti.com</code>; translates HyperConnect's non-standard failures.</td></tr>
+  <tr><td><code>list_centers()</code></td><td>Every center the key can see. Accepts both the <code>centers</code> and <code>requested_centers</code> response keys.</td></tr>
+  <tr><td><code>centers_to_fetch(center_id)</code></td><td><code>[(id, name)]</code> — one center when given, otherwise all.</td></tr>
+  <tr><td><code>date_chunks(start, end, max_span)</code></td><td>Yields ISO date pairs covering a range, each within the route's cap.</td></tr>
+  <tr><td><code>default_date_range(days=7)</code></td><td><code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code>, else the last N days.</td></tr>
+  <tr><td><code>write_csv(rows, columns, path)</code></td><td>Writes and returns the row count; writes nothing when there are no rows.</td></tr>
+  <tr><td><code>columns_of(rows)</code></td><td>Union of keys across rows, in first-seen order.</td></tr>
+  <tr><td><code>hc_yyyymmdd(date_string)</code></td><td><code>"2026-10-03"</code> &rarr; <code>20261003</code>.</td></tr>
+  <tr><td><code>hc_iso_date(value)</code></td><td><code>20261003</code> &rarr; <code>"2026-10-03"</code>; <code>None</code> passes through.</td></tr>
+</table>
+<p>Run <code>python zconnect\_client.py</code> for its self-check, or <code>python zconnect\_client.py --centers</code> to list center IDs.</p>
+
+<h4>Error conventions</h4>
+<table>
+  <tr><th>What you see</th><th>What it means</th></tr>
+  <tr><td><code>CT028</code> with HTTP 200</td><td><strong>Empty result, not a failure.</strong> A range with no activity answers this instead of an empty list. Handled silently.</td></tr>
+  <tr><td><code>CT004</code> / <code>CT026</code> / <code>CT060</code> / <code>CT061</code></td><td>Real errors — invalid input, missing center, missing dates.</td></tr>
+  <tr><td>HTTP <code>403</code></td><td>Usually throttling, not permission. The same request succeeds moments later, so it is retried.</td></tr>
+  <tr><td>HTTP <code>401</code> on HyperConnect</td><td><code>HC_TOKEN</code> expired — paste a fresh one.</td></tr>
+  <tr><td>403 <em>"Invalid key=value pair"</em></td><td>That HyperConnect route does not exist.</td></tr>
+  <tr><td><code>{"statusCode": 500}</code> with HTTP 200</td><td>Some HyperConnect handlers report failures this way.</td></tr>
+</table>
+
+<h2>Environment variables</h2>
+<table>
+  <tr><th>Variable</th><th>Used by</th><th>Notes</th></tr>
+  <tr><td><code>ZENOTI_API_KEY</code></td><td><strong>every script</strong></td><td>Required, always — <code>_client.py</code> refuses to import without it, so even the HyperConnect-only scripts need it present. Sent as <code>apikey</code>.</td></tr>
+  <tr><td><code>ZENOTI_BASE_URL</code></td><td>all ZConnect routes</td><td>Defaults to <code>https://api.zenoti.com</code>. A trailing <code>/v1</code> is stripped.</td></tr>
+  <tr><td><code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code></td><td>all scripts</td><td>Default date range when no flags are given.</td></tr>
+  <tr><td><code>ZENOTI_CENTER_ID</code></td><td>—</td><td><strong>Not used for scoping.</strong> Only <code>--center-id</code> narrows.</td></tr>
+  <tr><td><code>ZENOTI_REQUEST_DELAY</code></td><td>ZConnect routes</td><td>Pause between calls. Default <code>0.4</code>.</td></tr>
+  <tr><td><code>ZENOTI_MAX_RETRIES</code></td><td>both hosts</td><td>Default <code>5</code>.</td></tr>
+  <tr><td><code>ZENOTI_RETRY_BACKOFF</code></td><td>both hosts</td><td>First backoff in seconds; doubles each attempt. Default <code>5</code>.</td></tr>
+  <tr><td><code>HC_TOKEN</code></td><td><code>call_logs.py</code>, <code>agent_metrics.py</code>, <code>location_performance.py</code></td><td>Required by those three. Expires; not replaceable by the apikey.</td></tr>
+  <tr><td><code>HC_ORG_ID</code></td><td>HyperConnect scripts</td><td>Stable per account.</td></tr>
+  <tr><td><code>HC_BASE_URL</code></td><td>HyperConnect scripts</td><td>Defaults to <code>https://hyperconnectapi.zenoti.com</code>.</td></tr>
+  <tr><td><code>HC_UTC_OFFSET</code></td><td><code>call_logs.py</code></td><td>Centre timezone used to derive <code>timestamp_local</code>. Default <code>-04:00</code>.</td></tr>
+  <tr><td colspan="3" style="background:var(--code-bg)"><em>Raw call-log pulls replace <code>timestamp</code> (epoch ms) with <code>timestamp_utc</code> and <code>timestamp_local</code>. Anything reading the old numeric column must be updated.</em></td></tr>
+</table>
+
+<h2>Output files</h2>
+<p>Default names are distinct per script and per mode, so one run cannot silently overwrite another's output.</p>
+<table>
+  <tr><th>Pattern</th><th>Written by</th></tr>
+  <tr><td><code>zconnect_events[_all][_&lt;filter&gt;][_meta]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>events.py</code></td></tr>
+  <tr><td><code>zconnect_usage[_all]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>usage_data.py</code></td></tr>
+  <tr><td><code>zconnect_feedbacks[_all]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>feedback_metrics.py</code></td></tr>
+  <tr><td><code>hc_call_logs[_&lt;by&gt;]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>call_logs.py</code></td></tr>
+  <tr><td><code>hc_agent_metrics[_daily]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>agent_metrics.py</code></td></tr>
+  <tr><td><code>hc_location_performance_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>location_performance.py</code></td></tr>
+  <tr><td><code>hc_org_performance_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>location_performance.py --org</code></td></tr>
+  <tr><td><code>hc_call_volume_timeseries_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>location_performance.py --timeseries</code></td></tr>
+</table>
+<p><code>_all</code> appears when more than one center was fetched. <code>hc_call_logs_agent</code> and <code>hc_agent_metrics</code> are <em>different</em> datasets — the latter comes from the Agent Metrics route and includes rating and time-to-answer; the former is a call-log rollup that has neither.</p>
+
+<h2>Files in this folder</h2>
+<ul class="files">
+  <li><code>_client.py</code> <span>— shared session, retries, date chunking, CSV writer</span></li>
+  <li><code>events.py</code> <span>— centre timeline events, with optional metadata expansion</span></li>
+  <li><code>usage_data.py</code> <span>— messaging usage per centre per day</span></li>
+  <li><code>feedback_metrics.py</code> <span>— review counts per centre per day</span></li>
+  <li><code>call_logs.py</code> <span>— HyperConnect call logs and rollups</span></li>
+  <li><code>agent_metrics.py</code> <span>— Agent Metrics screen</span></li>
+  <li><code>location_performance.py</code> <span>— Location performance screen, org KPIs, call-volume chart</span></li>
+</ul>
+
+<footer>
+  Generated for the <code>zconnect</code> folder. Behaviour described here is verified against live responses; the numbers quoted (agent counts, row counts, window caps) come from real pulls.
+</footer>
+
+</body>
+</html>

@@ -964,4 +964,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import service_log
+
+    # Same treatment the pipeline and zconnect give their logs: written to a file
+    # and uploaded to the shared Drive folder, on success and on failure alike.
+    _log_path = service_log.start("aesthetix_ingestion_logs")
+    try:
+        main()
+    finally:
+        service_log.upload(_log_path)

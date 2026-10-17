@@ -1,0 +1,19 @@
+# For the zconnect service's own image (zconnect/Dockerfile), not the pipeline's.
+#
+# Only what this folder actually needs. It imports pyodbc and dotenv directly, and
+# hc_sql_helper/import_hc_report.py loads dbquery/import_aesthetix_opportunity_history.py
+# as its shared CSV and DDL helper -- that one imports pandas. requests is imported by
+# _client.py and is not pulled in by anything else here, so it is named outright.
+# The three Google packages are for service_log.py, which uploads the run log to
+# Google Drive; google-auth does not bring requests with it, hence both.
+#
+# playwright is the login: login_headers.py drives a real browser and reads the
+# Bearer token off the dashboard's own API calls. The package alone ships no
+# Chromium -- the Dockerfile installs the browser separately.
+pandas
+playwright
+pyodbc
+python-dotenv
+requests
+google-auth
+google-api-python-client

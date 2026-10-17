@@ -1,0 +1,4 @@
+{
+  "//": "The pipeline scripts add these folders to sys.path at runtime, so Pylance cannot see the sibling imports (e.g. zconnect/hc_sql_helper/import_hc_report.py importing dbquery/import_aesthetix_opportunity_history.py). Listing them here resolves those imports for the editor only -- nothing at run time reads this file.",
+  "extraPaths": ["Zenoti", "Zenoti/dbquery", "Zenoti/zconnect", "Zenoti/zconnect/hc_sql_helper"]
+}
