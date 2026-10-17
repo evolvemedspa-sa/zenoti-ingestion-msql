@@ -4,8 +4,7 @@
 #
 # Build context must be the folder above (Zenoti/), not this one. zconnect reaches
 # outside itself at run time: the helpers in zconnect/hc_sql_helper/ put Zenoti/
-# and Zenoti/dbquery/ on sys.path to import db_helper and
-# import_aesthetix_opportunity_history. A context of zconnect/ alone would break
+# on sys.path to import db_helper. A context of zconnect/ alone would break
 # every load with an ImportError. On Railway: Root Directory Zenoti,
 # Dockerfile Path zconnect/Dockerfile.
 FROM python:3.11-slim

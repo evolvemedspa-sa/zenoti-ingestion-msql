@@ -62,8 +62,9 @@ Columns are not fixed on either side: the CSVs are written from whatever the API
 returned, and the tables are whatever they are. Nothing here hardcodes a column.
 CSV headers and table column names are matched on their NORMALIZED form, and each
 value is coerced by the target column's LIVE type read from INFORMATION_SCHEMA at
-run time. That machinery is reused from dbquery/import_aesthetix_opportunity_history.py
-rather than copied a second time.
+run time. That machinery lives in csv_table.py beside this file -- the same
+helpers dbquery/import_aesthetix_opportunity_history.py uses, copied because
+that folder is gitignored and so never reaches the deployment image.
 
 Usage:
     python import_hc_report.py --report location_performance --check-db
@@ -96,9 +97,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))          # hc_sql_helper/, th
 _WORKDIR = os.path.dirname(_HERE)                            # zconnect/ -- where the pulls write their CSVs
 _ROOT = os.path.dirname(_WORKDIR)                            # Zenoti/
 
-# db_helper.py sits at the root; the shared CSV->table machinery sits in dbquery/.
+# db_helper.py sits at the root; the CSV->table machinery is csv_table.py beside
+# this file (a copy of dbquery/'s, which is gitignored and so never ships).
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.join(_ROOT, "dbquery"))
 
 import pyodbc  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
@@ -106,10 +107,9 @@ from dotenv import load_dotenv  # noqa: E402
 from db_helper import get_connection  # noqa: E402
 
 # normalize_col, the type-aware coercers, _table_columns, _to_tuples,
-# _validate_types, _mapping_report, _insert_batched. Importing rather than
-# copying keeps one copy of that logic -- importing also runs its own
-# load_dotenv and reads argv, both harmless here (its constants are unused).
-import import_aesthetix_opportunity_history as base  # noqa: E402
+# _validate_types, _mapping_report. Imported under the original's name so the
+# call sites below read the same as before.
+import csv_table as base  # noqa: E402
 
 # The real .env is two levels up (Zenoti/.env); a zconnect/.env, which is where
 # login_headers.py writes HC_TOKEN, wins over it, and a .env beside this file
