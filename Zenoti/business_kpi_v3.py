@@ -24,11 +24,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 CSV_SOURCE = os.getenv("CSV_SOURCE", "local").lower()
 if CSV_SOURCE == "gdrive":
     from gdrive_helper import get_csv_from_gdrive
+    # `or CSV_FILE` keeps a configured local path as the fallback; assigning the
+    # helper's None straight over it is what turned an empty Drive folder into
+    # "CSV_FILE must be set" further down.
     CSV_FILE = get_csv_from_gdrive(
         os.getenv("GDRIVE_FOLDER_BUSINESS_KPI"),
         credentials_json=os.getenv("GDRIVE_CREDENTIALS_JSON"),
         credentials_file=os.getenv("GDRIVE_CREDENTIALS_FILE", "service_account.json"),
-    )
+    ) or CSV_FILE
 
 if not all([SERVER, DATABASE, DB_USER, DB_PASSWORD]):
     missing = [k for k, v in {"SERVER": SERVER, "DATABASE": DATABASE, "DB_USER": DB_USER, "DB_PASSWORD": DB_PASSWORD}.items() if not v]
@@ -114,7 +117,10 @@ def normalize_time(val):
 # Load CSV(s) and process one file at a time
 # ==================================
 if not CSV_FILE:
-    raise ValueError("CSV_FILE must be set in the .env and point to a file or directory")
+    # An empty Drive folder is a day with nothing to load, not a broken run --
+    # the other ingest scripts skip the same way, and the pipeline carries on.
+    print("SKIP: No CSV file available for business_kpi. Exiting.")
+    raise SystemExit(0)
 
 csv_paths = []
 if os.path.isdir(CSV_FILE):
