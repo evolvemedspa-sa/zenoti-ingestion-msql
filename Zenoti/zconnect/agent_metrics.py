@@ -55,12 +55,14 @@ Without it those three cells would be Python dict reprs and 23 table columns
 would load NULL.
 """
 import argparse
+import math
 import os
 import sys
 
 import _client as zc
 
 PATH = "/dashboard/fetch_all_agent_data"
+MAX_ANSWER_TIME_SECONDS = 24 * 60 * 60
 
 
 def parse_args():
@@ -92,6 +94,30 @@ def _spread(mapping, prefix=""):
     return row
 
 
+def _agent_metrics(agent):
+    return _spread({key: value for key, value in agent.items()
+                    if key not in ("id", "name", "date")})
+
+
+def _valid_answer_time(value):
+    """Whether an average answer time is a plausible elapsed time in seconds."""
+    if value is None:
+        return True
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return math.isfinite(seconds) and 0 <= seconds <= MAX_ANSWER_TIME_SECONDS
+
+
+def _invalid_answer_time_count(agent):
+    return sum(
+        not _valid_answer_time(value)
+        for name, value in _agent_metrics(agent).items()
+        if name.endswith("average_time_to_answer")
+    )
+
+
 def _flatten(agent, center_id, center_name, window_start, window_end):
     """One agent-day as a flat row, tagged with its center and its own day.
 
@@ -114,8 +140,11 @@ def _flatten(agent, center_id, center_name, window_start, window_end):
         "end_date": day or window_end,
         "date": day,
     }
-    row.update(_spread({key: value for key, value in agent.items()
-                        if key not in ("id", "name", "date")}))
+    metrics = _agent_metrics(agent)
+    for name, value in metrics.items():
+        if name.endswith("average_time_to_answer") and not _valid_answer_time(value):
+            metrics[name] = None
+    row.update(metrics)
     return row
 
 
@@ -138,8 +167,14 @@ def fetch_center(center_id, center_name, args, start_date, end_date):
     """Every agent-day for one center. The response carries no paging fields, so
     this is a single call however wide the window."""
     payload = zc.hc_post(PATH, _body(center_id, start_date, end_date, args.call_mode))
+    agents = payload.get("agents") or []
+    invalid_answer_times = sum(_invalid_answer_time_count(agent) for agent in agents)
+    if invalid_answer_times:
+        print(f"  WARN    {center_name or center_id}: {invalid_answer_times} average answer "
+              f"time value(s) outside 0..{MAX_ANSWER_TIME_SECONDS} seconds across metrics; "
+              "exported as NULL")
     return [_flatten(agent, center_id, center_name, start_date, end_date)
-            for agent in payload.get("agents") or []]
+            for agent in agents]
 
 
 def main():
@@ -209,6 +244,28 @@ if __name__ == "__main__":
     undated = _flatten({"id": "a1", "name": "Jane", "date": None}, "c1", "C", "2026-10-01", "2026-10-15")
     assert undated["date"] is None, undated
     assert (undated["start_date"], undated["end_date"]) == ("2026-10-01", "2026-10-15"), undated
+
+    # The source can return an epoch-like value in a seconds metric; preserve
+    # plausible values and leave impossible elapsed times NULL for SQL.
+    answer_time = _flatten(
+        {"id": "a1", "name": "Jane", "average_time_to_answer": 3.37},
+        "c1", "C", "2026-10-01", "2026-10-15",
+    )
+    assert answer_time["average_time_to_answer"] == 3.37, answer_time
+    bad_answer_time = _flatten(
+        {"id": "a1", "name": "Jane", "average_time_to_answer": 1771703074.69},
+        "c1", "C", "2026-10-01", "2026-10-15",
+    )
+    assert bad_answer_time["average_time_to_answer"] is None, bad_answer_time
+    bad_direct_answer_time = _flatten(
+        {"id": "a1", "name": "Jane",
+         "direct": {"average_time_to_answer": 1771703074.69}},
+        "c1", "C", "2026-10-01", "2026-10-15",
+    )
+    assert bad_direct_answer_time["direct_average_time_to_answer"] is None, bad_direct_answer_time
+    assert _invalid_answer_time_count(
+        {"average_time_to_answer": 3.37, "direct": {"average_time_to_answer": 1771703074.69}}
+    ) == 1
 
     # Daily is not a flag any more: the body always asks for it, or the pull
     # silently returns one windowed row per agent and the table's day grain goes.
