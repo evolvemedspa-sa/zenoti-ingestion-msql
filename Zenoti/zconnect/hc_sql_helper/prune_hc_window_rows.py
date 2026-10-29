@@ -78,9 +78,11 @@ def self_check():
         expected = [("2026-10-14", "2026-10-14", "2026-10-14")]
         assert rows == expected, (report, rows)
 
-    # call_logs is per-call and already daily-capable: every date it carries is
-    # the call's own timestamp, so there is nothing windowed to remove.
-    assert set(NOT_DAILY) == set(ihr.REPORTS) - {"call_logs"}, set(NOT_DAILY)
+    # This one-off migration only targets the two dashboard reports that
+    # changed from window grain to day grain. Feedback and events are not part
+    # of that migration.
+    assert set(NOT_DAILY) == {"agent_metrics", "location_performance"}, set(NOT_DAILY)
+    assert set(NOT_DAILY) <= set(ihr.REPORTS), set(NOT_DAILY) - set(ihr.REPORTS)
     print("self-check OK")
     return 0
 

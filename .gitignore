@@ -12,6 +12,9 @@ Zenoti/.env
 Zenoti/.venv/
 Zenoti/service_account.json
 Zenoti/dbquery/
+!Zenoti/dbquery/
+Zenoti/dbquery/*
+!Zenoti/dbquery/check_hc_records.py
 Zenoti/sample csv/
 
 # --- Environment Variables & Secrets ---

@@ -67,8 +67,12 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta
 
+from dotenv import load_dotenv
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)          # Zenoti/ -- service_log.py and gdrive_helper.py
+load_dotenv(os.path.join(_ROOT, ".env"))
+
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -85,14 +89,12 @@ def print(*args, **kwargs):
     """
     builtins.print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}]", *args, **kwargs)
 
-# Run order, and also what --only/--skip accept. Only the reports that have an
-# Azure SQL table are here, so a bare run pulls and loads exactly those; the rest
-# of the reports still run on their own (python events.py).
-# SCRIPTS = ("agent_metrics", "feedback_metrics", "location_performance", "call_logs", "events")
+# Run order, and also what --only/--skip accept. Reports without a configured
+# SQL destination still run and leave their CSV in this folder.
 # call_logs last: it pages through a chunked date range, so it is by far the
 # longest pull, and a slow or truncated one should not hold up the two small
 # tables that have nothing to do with it.
-SCRIPTS = ("agent_metrics", "location_performance", "call_logs")
+SCRIPTS = ("agent_metrics", "feedback_metrics", "location_performance", "events", "call_logs")
 
 # Extra flags per script when --hc-extras is on.
 HC_EXTRAS = {"location_performance": ["--org", "--timeseries"]}
@@ -103,8 +105,13 @@ HC_EXTRAS = {"location_performance": ["--org", "--timeseries"]}
 INGEST = {
     "location_performance": "location_performance",
     "agent_metrics": "agent_metrics",
+    "feedback_metrics": "feedback_metrics",
+    "events": "events",
     "call_logs": "call_logs",
 }
+
+# Do not attempt the SQL handoff unless its destination is configured.
+INGEST_REQUIRED_ENV = {"events": ("TABLE_HC_EVENTS",)}
 
 # The loader lives in hc_sql_helper/ with the other scripts that only touch
 # Azure SQL -- no API, nothing to pull. The pull scripts stay here, beside the
@@ -241,6 +248,14 @@ def build_ingest_command(name, csv_path):
     return [sys.executable, IMPORTER, "--report", INGEST[name], "--csv", csv_path]
 
 
+def should_ingest(name, environ=None):
+    """Whether the report has a configured SQL destination."""
+    environ = os.environ if environ is None else environ
+    return name in INGEST and all(
+        environ.get(key) for key in INGEST_REQUIRED_ENV.get(name, ())
+    )
+
+
 def ingest_report(name, csv_path):
     """Load one report's CSV into its table. Returns (status, seconds).
 
@@ -268,6 +283,10 @@ def _selftest():
     assert build_command("agent_metrics")[2:] == []
     assert build_command("location_performance", hc_extras=True)[2:] == ["--org", "--timeseries"]
     assert build_command("agent_metrics", hc_extras=True)[2:] == []
+    assert {"feedback_metrics", "events"} <= set(SCRIPTS)
+    assert should_ingest("feedback_metrics", {})
+    assert not should_ingest("events", {})
+    assert should_ingest("events", {"TABLE_HC_EVENTS": "dbo.BRONZE_ZENOTI_EVENTS_REVIEWS"})
 
     class A:
         token = "Bearer AN:evolvemedspa|abc "
@@ -389,7 +408,7 @@ def run(args):
     results = []
     for name in selected:
         print(f"\n  {name}")
-        csv_path = os.path.join(scratch, f"{name}.csv") if scratch and name in INGEST else None
+        csv_path = os.path.join(scratch, f"{name}.csv") if scratch and should_ingest(name) else None
         status, elapsed = run_script(
             name, token, csv_path=csv_path,
             start_date=start_date, end_date=end_date, center_id=args.center_id,

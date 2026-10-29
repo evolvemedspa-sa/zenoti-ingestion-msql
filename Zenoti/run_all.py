@@ -29,15 +29,17 @@ SCRIPTS = [
     # stock_inventory.py runs late: it appends a full stock snapshot and is the
     # slowest step, so a failure here should not hold up the other loads.
     "stock_inventory.py",
+    # This fetches the rolling birthday window and refreshes those guest keys in
+    # SQL. Run it after the other database loads, before the final order import.
+    "get_guest_birthday_v3.py",
     # po_and_transfers.py runs last: it loads the order-level CSV and then chains
     # the Zenoti API pulls for purchase_order.py / transfer_order.py, so it is the
-    # longest step and the only one that depends on a live API.
+    # longest step and depends on a live API.
     "po_and_transfers.py",
 ]
 
-# Scripts whose failure is logged but does not stop the pipeline or fail the run.
-# Everything before them has already committed, and nothing downstream reads
-# their tables, so there is nothing to protect by aborting.
+# The order import is independent of the other loads, so its failure is logged
+# without stopping the run or marking the pipeline failed.
 NON_BLOCKING = {"po_and_transfers.py"}
 
 script_dir = os.path.dirname(os.path.abspath(__file__))

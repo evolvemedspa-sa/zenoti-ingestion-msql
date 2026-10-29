@@ -198,6 +198,25 @@ SELECT
 FROM stock_inventory
 ```
 
+## ZConnect Feedback and Events CSV Loads
+
+`Zenoti/zconnect/sync_hc.py` now runs `feedback_metrics` and `events` alongside
+the other HyperConnect reports. Feedback metrics are loaded using
+`TABLE_HC_FEEDBACK` from `Zenoti/.env`; events are loaded using `TABLE_HC_EVENTS`.
+
+Previously downloaded CSVs can be loaded independently:
+
+```powershell
+python Zenoti\zconnect\hc_ingestion\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv" --dry-run
+python Zenoti\zconnect\hc_ingestion\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv"
+python Zenoti\zconnect\hc_ingestion\ingest_events.py "Zenoti\sample csv\zconnect_events_all_2025-01-01_2025-12-31.csv" --dry-run
+```
+
+The feedback loader replaces rows by `center_id` and `date`; the events loader
+replaces rows by `centerid`, `event_id`, and `send_date`. The events destination must already
+exist and defaults to `dbo.BRONZE_ZENOTI_EVENTS_REVIEWS`; `TABLE_HC_EVENTS` in
+`Zenoti/.env` can override it.
+
 ## Verification
 
 After running `stock_inventory.py`, check the load with:

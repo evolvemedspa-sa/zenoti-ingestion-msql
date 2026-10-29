@@ -6,6 +6,8 @@ the same job: sync_hc.py pulls, this loads. One table each:
     hc_location_performance_<start>_<end>.csv   ->  HC Location Performance Table
     hc_agent_metrics_<start>_<end>.csv          ->  HC Agent Metrics
     hc_call_logs_<start>_<end>.csv              ->  HC Call Logs
+    zconnect_feedbacks_<start>_<end>.csv         ->  HC Feedback Metrics
+    zconnect_events_<start>_<end>.csv            ->  HC Events
 
 REPLACE THE WINDOW. Each load deletes the rows it is about to insert and then
 inserts them, both in one transaction, so a re-pulled window is refreshed rather
@@ -81,8 +83,12 @@ Usage:
     --self-check    no DB, no file: exercise the file-picking logic
 
 Set TABLE_ZENOTI_HC_LOCATION_PERFORMANCE / TABLE_ZENOTI_HC_AGENT_METRICS /
-TABLE_ZENOTI_HC_CALL_LOGS in .env to point at different tables; the names above
-are the default.
+TABLE_ZENOTI_HC_CALL_LOGS / TABLE_HC_FEEDBACK / TABLE_HC_EVENTS in .env to point
+at different tables; the names above are the default.
+
+Loader-owned audit columns, when present, are populated from the import:
+`_source_file` stores the CSV basename, and `_loaded_at_utc` stores the UTC load
+time. `date_inserted` and `ingestion_timestamp` retain their existing behavior.
 """
 
 import glob
@@ -91,7 +97,7 @@ import re
 import sys
 import textwrap
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))          # hc_sql_helper/, this folder
 _WORKDIR = os.path.dirname(_HERE)                            # zconnect/ -- where the pulls write their CSVs
@@ -171,12 +177,27 @@ REPORTS = {
         "prefix": "hc_call_logs_",
         "key": ("call_id",),
     },
+    "feedback_metrics": {
+        "label": "HC Feedback Metrics",
+        "env": "TABLE_HC_FEEDBACK",
+        "table": "dbo.BRONZE_ZENOTI_HC_FEEDBACK",
+        "prefix": "zconnect_feedbacks_",
+        "key": ("center_id", "date"),
+    },
+    "events": {
+        "label": "HC Events",
+        "env": "TABLE_HC_EVENTS",
+        "table": "dbo.BRONZE_ZENOTI_EVENTS_REVIEWS",
+        "prefix": "zconnect_events_",
+        "key": ("centerid", "event_id", "send_date"),
+    },
 }
 
 DRY_RUN = "--dry-run" in sys.argv
 CHECK_DB = "--check-db" in sys.argv
 VERBOSE = "--verbose" in sys.argv
 SELF_CHECK = "--self-check" in sys.argv
+LOADER_AUDIT_COLUMNS = (*base.AUDIT_TIME_COLUMNS, "_source_file", "_loaded_at_utc")
 
 
 def arg_value(name):
@@ -340,6 +361,18 @@ def drop_csv_dupes(dict_rows, key_cols):
     return out, dropped
 
 
+def stamp_audit_columns(dict_rows, source_file):
+    """Fill loader-owned audit columns before mapping and type validation."""
+    local_now = datetime.now()
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    source_name = os.path.basename(source_file)
+    for row in dict_rows:
+        for audit in base.AUDIT_TIME_COLUMNS:
+            row.setdefault(base.normalize_col(audit), local_now)
+        row["source_file"] = source_name
+        row["loaded_at_utc"] = utc_now
+
+
 # The two ceilings one statement has to stay under, and neither is the number to
 # sit on. MAX_PARAMS: SQL Server's limit is 2100, and a real 11k-row call_logs
 # load failed with "too many parameters ... maximum of 2100" on a DELETE carrying
@@ -379,7 +412,12 @@ def delete_keys(cursor, tbl, insert_columns, key_cols, data):
     col_list = ", ".join(f"[{c}]" for c in key_cols)
     positions = [insert_columns.index(c) for c in key_cols]
     deleted = 0
-    for batch in chunked(data, len(key_cols)):
+    batches = chunked(data, len(key_cols))
+    started = time.monotonic()
+    print(f"  update  checking {len(data):,} records for existing matches",
+          flush=True)
+    checked = 0
+    for batch_number, batch in enumerate(batches, start=1):
         keys = [[row[i] for i in positions] for row in batch]
         rows = ", ".join("(" + ", ".join("?" * len(key_cols)) + ")" for _ in keys)
         cursor.execute(
@@ -389,6 +427,11 @@ def delete_keys(cursor, tbl, insert_columns, key_cols, data):
             [value for key in keys for value in key],
         )
         deleted += cursor.rowcount
+        checked += len(batch)
+        if batch_number % 10 == 0 or batch_number == len(batches):
+            print(f"          Checked {checked:,} of {len(data):,} records; "
+                  f"{deleted:,} existing records replaced "
+                  f"({time.monotonic() - started:.1f}s)", flush=True)
     return deleted
 
 
@@ -402,6 +445,9 @@ def insert_rows(cursor, tbl, insert_columns, data):
     col_list = ", ".join(f"[{c}]" for c in insert_columns)
     batches = chunked(data, len(insert_columns))
     inserted = 0
+    sent = 0
+    started = time.monotonic()
+    print(f"  save    saving {len(data):,} records", flush=True)
     for start, batch in enumerate(batches):
         rows = ", ".join("(" + ", ".join("?" * len(insert_columns)) + ")" for _ in batch)
         cursor.execute(
@@ -409,12 +455,15 @@ def insert_rows(cursor, tbl, insert_columns, data):
             [value for row in batch for value in row],
         )
         inserted += cursor.rowcount
+        sent += len(batch)
         # Worth having: the parameter cap is what sets the round-trip count, 185
         # of them for an 11k-row 33-column load, and elapsed time is dominated by
         # those. Silent, a slow load is indistinguishable from a hung one.
-        if len(batches) > 1 and start % 50 == 49:
-            print(f"          {min((start + 1) * len(batch), len(data)):,}/{len(data):,} sent, "
-                  f"{inserted:,} inserted", flush=True)
+        completed_batches = start + 1
+        if completed_batches % 25 == 0 or completed_batches == len(batches):
+            print(f"          Saved {sent:,} of {len(data):,} records; "
+                  f"{inserted:,} new records so far "
+                  f"({time.monotonic() - started:.1f}s)", flush=True)
     return inserted
 
 
@@ -430,7 +479,7 @@ def replace_rows(cursor, tbl, insert_columns, key_cols, data):
     return deleted, insert_rows(cursor, tbl, insert_columns, data)
 
 
-def load_report(conn, cursor, label, qualified, dict_rows, key):
+def load_report(conn, cursor, label, qualified, dict_rows, key, source_file):
     """Replace one CSV's worth of rows in one table, as its own transaction.
 
     Coercion, the key check and the type pre-flight all run before the first
@@ -438,36 +487,39 @@ def load_report(conn, cursor, label, qualified, dict_rows, key):
     and the insert are one transaction -- see the module docstring.
     """
     if not dict_rows:
-        print("  skip    nothing to load, the CSV parsed to 0 rows")
+        print("  ingestion status: SKIPPED (no rows)")
         return
 
+    print("  ingestion status: IN PROGRESS", flush=True)
     schema, name = base._split_table(qualified)
+    print(f"  setup   checking destination table {qualified}", flush=True)
     columns, identity, col_types, lengths = base._table_columns(cursor, schema, name)
     if not columns:
+        print("  ingestion status: FAILED (destination table is missing)", flush=True)
         raise SystemExit(f"  FAILED  {label} does not exist -- create it out-of-band first"
                          f"\n          {qualified}")
     insert_columns = [c for c in columns if c not in identity]
     tbl = f"[{schema}].[{name}]"
+    print(f"  setup   destination is ready ({len(columns):,} columns)",
+          flush=True)
 
     # Before anything else: a key column the table does not have would compare
     # nothing and re-insert every row on every run, which reads as a clean load.
     key_cols, missing_key = resolve_key(key, insert_columns)
     if missing_key:
+        print("  ingestion status: FAILED (destination key columns are missing)", flush=True)
         raise SystemExit(
             f"  FAILED  {label} has no column for the key: {', '.join(missing_key)}\n"
             f"          Those columns are what say a row is already loaded, so without them\n"
             f"          every run re-inserts everything. Nothing was written.\n"
             f"          Add them to {qualified}, then rerun."
         )
+    print(f"  setup   preparing {len(dict_rows):,} records", flush=True)
     dict_rows, dropped = drop_csv_dupes(dict_rows, key_cols)
     if dropped:
         print(f"  dup     {dropped:,} row(s) repeated in the CSV, first kept")
 
-    # Fill whichever load-time stamp column the table has.
-    now_dt = datetime.now()
-    for row in dict_rows:
-        for audit in base.AUDIT_TIME_COLUMNS:
-            row.setdefault(audit, now_dt)
+    stamp_audit_columns(dict_rows, source_file)
 
     _, db_no_source, csv_unused = base._mapping_report(
         [k for k in dict_rows[0].keys()], insert_columns
@@ -475,7 +527,7 @@ def load_report(conn, cursor, label, qualified, dict_rows, key):
     # The audit columns were stamped on above, so the table not having them is
     # not a mapping gap to report -- listing them reads as if the CSV carried
     # columns nobody asked for.
-    audit_norms = {base.normalize_col(a) for a in base.AUDIT_TIME_COLUMNS}
+    audit_norms = {base.normalize_col(a) for a in LOADER_AUDIT_COLUMNS}
     gaps = [c for c in db_no_source if base.normalize_col(c) not in audit_norms]
     csv_unused = [c for c in csv_unused if base.normalize_col(c) not in audit_norms]
     if gaps:
@@ -485,11 +537,17 @@ def load_report(conn, cursor, label, qualified, dict_rows, key):
         print(f"  drop    {len(csv_unused)} CSV column(s) with no column in {label}")
         _note("", csv_unused)
 
+    print(f"  check   checking {len(dict_rows):,} records before saving",
+          flush=True)
+    validation_started = time.monotonic()
     bad = base._validate_types(dict_rows, insert_columns, col_types, lengths)
     # Same shape {col: (count, samples)}, so one report covers both a value too
     # long for its column and one that is not the right kind of thing at all.
     bad.update(bad_guids(dict_rows, insert_columns, col_types))
+    print(f"  check   finished in {time.monotonic() - validation_started:.1f}s",
+          flush=True)
     if bad:
+        print("  ingestion status: FAILED (column values do not fit)", flush=True)
         for col, (count, samples) in bad.items():
             print(f"  {col} ({col_types.get(col)}): {count} value(s) that do not fit, e.g. {samples}")
         guids = [c for c in bad if (col_types.get(c) or "").lower() == "uniqueidentifier"]
@@ -500,17 +558,23 @@ def load_report(conn, cursor, label, qualified, dict_rows, key):
         raise SystemExit("  FAILED  nothing written: the values above do not fit their live "
                          "columns.\n          Fix them and rerun.")
 
+    print("  setup   preparing records for the database", flush=True)
     data = base._to_tuples(dict_rows, insert_columns, col_types)
 
     # Delete and insert share this one transaction, so a failure anywhere leaves
     # the previous load of this window in place rather than a hole where it was.
     try:
+        print("  update  applying refreshed records; changes are saved together when complete",
+              flush=True)
         deleted, inserted = replace_rows(cursor, tbl, insert_columns, key_cols, data)
+        print("  update  finalizing changes", flush=True)
         conn.commit()
         note = f", {deleted:,} replaced" if deleted else " (all new)"
         print(f"  wrote   {inserted:,} row(s){note}   (key: {', '.join(key_cols)})", flush=True)
+        print("  ingestion status: SUCCESS", flush=True)
     except pyodbc.Error as err:
         conn.rollback()
+        print("  ingestion status: FAILED (transaction rolled back)", flush=True)
         raise SystemExit(f"  FAILED  rolled back, nothing written\n{_sql_message(err)}")
 
 
@@ -555,7 +619,7 @@ def check_db(csv_path, spec):
         dict_rows, csv_norm_names = base.parse_csv(csv_path)
         _, db_no_source, csv_unused = base._mapping_report(csv_norm_names, insert_columns)
         print(f"  csv     {os.path.basename(csv_path)}  {len(dict_rows):,} row(s)")
-        audit_norms = {base.normalize_col(a) for a in base.AUDIT_TIME_COLUMNS}
+        audit_norms = {base.normalize_col(a) for a in LOADER_AUDIT_COLUMNS}
         gaps = [c for c in db_no_source if base.normalize_col(c) not in audit_norms]
         csv_unused = [c for c in csv_unused if base.normalize_col(c) not in audit_norms]
         if gaps:
@@ -604,6 +668,22 @@ def check_db(csv_path, spec):
 def self_check():
     """No DB, no network: pin the file-picking decisions, which are the part a
     wrong guess turns into a silently wrong load."""
+    assert REPORTS["feedback_metrics"]["env"] == "TABLE_HC_FEEDBACK"
+    assert REPORTS["feedback_metrics"]["key"] == ("center_id", "date")
+    assert REPORTS["events"]["env"] == "TABLE_HC_EVENTS"
+    assert REPORTS["events"]["table"] == "dbo.BRONZE_ZENOTI_EVENTS_REVIEWS"
+    assert REPORTS["events"]["key"] == ("centerid", "event_id", "send_date")
+    audit_row = {"_source_file": "source-from-csv"}
+    stamp_audit_columns([audit_row], r"C:\exports\historical events.csv")
+    assert audit_row["source_file"] == "historical events.csv"
+    assert isinstance(audit_row["loaded_at_utc"], datetime)
+    assert audit_row["loaded_at_utc"].tzinfo is None
+    assert all(audit_row[base.normalize_col(name)] is not None for name in base.AUDIT_TIME_COLUMNS)
+    _, audit_gaps, _ = base._mapping_report(
+        list(audit_row), ["_source_file", "_loaded_at_utc", "date_inserted", "ingestion_timestamp"]
+    )
+    assert audit_gaps == [], audit_gaps
+
     import tempfile
 
     # A window with no file must be an error, never a fallback to some other
@@ -642,8 +722,11 @@ def self_check():
     # The fallback is only used when the env var is unset, so it has to name a
     # table that exists -- `dbo.TABLE_ZENOTI_HC_*` does not, and the schema
     # script that trusted this line aimed its ALTERs at nothing for a whole run.
-    assert all(s["table"].startswith("dbo.BRONZE_ZENOTI_HC_") for s in REPORTS.values()), \
-        [s["table"] for s in REPORTS.values()]
+    assert all(
+        REPORTS[name]["table"].startswith("dbo.BRONZE_ZENOTI_HC_")
+        for name in ("location_performance", "agent_metrics", "call_logs", "feedback_metrics")
+    ), [s["table"] for s in REPORTS.values()]
+    assert REPORTS["events"]["table"] == "dbo.BRONZE_ZENOTI_EVENTS_REVIEWS"
 
     # The key is matched in normalized form on both sides, and resolved to the
     # table's own spelling before the SQL is built.
@@ -763,6 +846,7 @@ def main():
 
     if DRY_RUN:
         print(f"  write   {spec['label']}  on {DATABASE}  (replace the window)")
+        print("  ingestion status: DRY RUN (not written)")
         print("\n  --dry-run: no database connection made, nothing written.")
         return
 
@@ -771,7 +855,7 @@ def main():
     try:
         cursor = conn.cursor()
         load_report(conn, cursor, spec["label"],
-                    os.getenv(spec["env"]) or spec["table"], dict_rows, spec["key"])
+                    os.getenv(spec["env"]) or spec["table"], dict_rows, spec["key"], csv_path)
         cursor.close()
     finally:
         conn.close()

@@ -67,8 +67,11 @@ ADD_TYPE = {
     "end_date": "date",
     "date": "date",
     "center_id": "uniqueidentifier",
+    "centerid": "uniqueidentifier",
     "agent_id": "nvarchar(64)",
     "call_id": "nvarchar(64)",   # 'CA' + 32 hex, 34 chars -- not a GUID
+    "event_id": "nvarchar(64)",
+    "send_date": "datetime2",
 }
 
 # A column that exists but cannot hold what arrives. Only ever added here because
@@ -325,6 +328,16 @@ def self_check():
     for report, spec in ihr.REPORTS.items():
         for column in spec["key"]:
             assert base.normalize_col(column) in ADD_TYPE, (report, column)
+
+    events = ihr.REPORTS["events"]["table"]
+    st, _ = plan("events", events, [], {}, {})
+    assert st == [
+        f"ALTER TABLE {events} ADD [centerid] uniqueidentifier NULL",
+        f"ALTER TABLE {events} ADD [event_id] nvarchar(64) NULL",
+        f"ALTER TABLE {events} ADD [send_date] datetime2 NULL",
+        f"CREATE UNIQUE INDEX [UX_BRONZE_ZENOTI_EVENTS_REVIEWS_KEY] ON {events} "
+        "([centerid], [event_id], [send_date])",
+    ], st
 
     print("self-check OK")
     return 0

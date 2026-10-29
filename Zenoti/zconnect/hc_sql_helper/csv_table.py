@@ -12,6 +12,7 @@ change.
 """
 import re
 from datetime import date, datetime
+import time
 
 import pandas as pd
 
@@ -84,7 +85,9 @@ DATE_DB_TYPES = {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffs
 # has no year and cannot become a valid DATE.
 _DATE_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S.%f",
     "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d",
     "%m/%d/%Y",
     "%m-%d-%Y",
@@ -240,7 +243,9 @@ def _validate_types(dict_rows, insert_columns, col_types, lengths=None, sample=5
             samples.append(raw)
         bad[col] = (cnt, samples)
 
-    for r in dict_rows:
+    started = time.monotonic()
+    total = len(dict_rows)
+    for row_number, r in enumerate(dict_rows, start=1):
         for col in insert_columns:
             raw = r.get(normalize_col(col))
             if raw is None:
@@ -261,6 +266,9 @@ def _validate_types(dict_rows, insert_columns, col_types, lengths=None, sample=5
                 # -1 is varchar(max)/nvarchar(max): unlimited, nothing to check.
                 if limit and limit > 0 and len(str(raw)) > limit:
                     flag(col, f"{raw!r} ({len(str(raw))} > {limit})")
+        if total > 50000 and row_number % 50000 == 0:
+            print(f"          Checked {row_number:,} of {total:,} records "
+                  f"({time.monotonic() - started:.1f}s)", flush=True)
     return bad
 
 
@@ -287,6 +295,13 @@ def _self_check():
     assert _coerce_numeric("$ 1,234.50 ", "x") == 1234.5
     assert _coerce_numeric("n/a", "x") is None
     assert _coerce_date("2026-10-01", "x") == datetime(2026, 10, 1)
+    assert _coerce_date("2025-03-27T18:06:40.297", "x") == datetime(
+        2025, 3, 27, 18, 6, 40, 297000
+    )
+    assert _coerce_date("2025-03-27T18:06:47.39", "x") == datetime(
+        2025, 3, 27, 18, 6, 47, 390000
+    )
+    assert _coerce_date("2025-03-27T18:06:59", "x") == datetime(2025, 3, 27, 18, 6, 59)
     assert _coerce_date("-", "x") is None
     assert _mapping_report(["a", "b"], ["A", "C"]) == (["A"], ["C"], ["b"])
 
