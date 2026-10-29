@@ -110,9 +110,6 @@ INGEST = {
     "call_logs": "call_logs",
 }
 
-# Do not attempt the SQL handoff unless its destination is configured.
-INGEST_REQUIRED_ENV = {"events": ("TABLE_HC_EVENTS",)}
-
 # The loader lives in hc_sql_helper/ with the other scripts that only touch
 # Azure SQL -- no API, nothing to pull. The pull scripts stay here, beside the
 # CSVs they write, and this is the one place the two halves meet.
@@ -248,12 +245,9 @@ def build_ingest_command(name, csv_path):
     return [sys.executable, IMPORTER, "--report", INGEST[name], "--csv", csv_path]
 
 
-def should_ingest(name, environ=None):
-    """Whether the report has a configured SQL destination."""
-    environ = os.environ if environ is None else environ
-    return name in INGEST and all(
-        environ.get(key) for key in INGEST_REQUIRED_ENV.get(name, ())
-    )
+def should_ingest(name):
+    """Whether the report has a SQL destination in the shared importer."""
+    return name in INGEST
 
 
 def ingest_report(name, csv_path):
@@ -284,9 +278,8 @@ def _selftest():
     assert build_command("location_performance", hc_extras=True)[2:] == ["--org", "--timeseries"]
     assert build_command("agent_metrics", hc_extras=True)[2:] == []
     assert {"feedback_metrics", "events"} <= set(SCRIPTS)
-    assert should_ingest("feedback_metrics", {})
-    assert not should_ingest("events", {})
-    assert should_ingest("events", {"TABLE_HC_EVENTS": "dbo.BRONZE_ZENOTI_EVENTS_REVIEWS"})
+    assert should_ingest("feedback_metrics")
+    assert should_ingest("events")
 
     class A:
         token = "Bearer AN:evolvemedspa|abc "
@@ -332,6 +325,8 @@ def _selftest():
     assert os.path.exists(IMPORTER), IMPORTER
     cmd = build_ingest_command("agent_metrics", r"C:\tmp\x.csv")
     assert cmd[1] == IMPORTER and cmd[2:] == ["--report", "agent_metrics", "--csv", r"C:\tmp\x.csv"], cmd
+    cmd = build_ingest_command("events", r"C:\tmp\events.csv")
+    assert cmd[2:] == ["--report", "events", "--csv", r"C:\tmp\events.csv"], cmd
     print("selftest ok")
 
 
