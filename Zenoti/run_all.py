@@ -16,6 +16,7 @@ SCRIPTS = [
     "cash.py",
     "memberships.py",
     "employee_sales.py",
+    "feedback_report.py",
     "stock_ledger.py",
     "business_kpi_v3.py",
     "fb_ads.py",
