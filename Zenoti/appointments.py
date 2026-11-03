@@ -163,7 +163,7 @@ for csv_col in df.columns:
             mapping[csv_col] = sql_col
             break
 
-df.rename(columns=mapping, inplace=True)
+df = df.rename(columns=mapping)
 
 # ==================================
 # Add Metadata Columns

@@ -360,7 +360,7 @@ for csv_path in csv_paths:
             mapping[csv_col] = sql_column_lookup[norm_csv]
 
     # Apply the final column renames before SQL alignment
-    df.rename(columns=mapping, inplace=True)
+    df = df.rename(columns=mapping)
 
     # Stop rather than load garbage. If nothing mapped, the "Create Missing
     # Columns" step below would happily build an all-NULL frame and the insert

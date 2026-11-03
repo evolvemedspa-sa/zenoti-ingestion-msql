@@ -6,7 +6,7 @@ physical destination table name.
 
 Runs beside run_all.py without importing anything from dbquery/. CSV_SOURCE
 selects local files or Google Drive, matching the other pipeline reports.
-The Drive folder is GDRIVE_FOLDER_FEEDBAC_REPORT (spelling is intentional).
+The Drive folder is GDRIVE_FOLDER_FEEDBACK_REPORT (spelling is intentional).
 Local input uses CSV_FILE_FEEDBACK_REPORT, or Feedback*.csv in sample csv/.
 --csv selects a local file or directory regardless of CSV_SOURCE.
 
@@ -347,9 +347,9 @@ def source_paths(args) -> list[Path]:
         return csv_paths(configured or DEFAULT_LOCAL_SOURCE, feedback_only=not configured)
     if source != "gdrive":
         raise ValueError("CSV_SOURCE must be local or gdrive.")
-    folder = args.gdrive_folder or os.getenv("GDRIVE_FOLDER_FEEDBAC_REPORT")
+    folder = args.gdrive_folder or os.getenv("GDRIVE_FOLDER_FEEDBACK_REPORT")
     if not folder:
-        raise ValueError("GDRIVE_FOLDER_FEEDBAC_REPORT is not set for feedback_report.")
+        raise ValueError("GDRIVE_FOLDER_FEEDBACK_REPORT is not set for feedback_report.")
     sys.path.insert(0, str(ZENOTI_DIR))
     from gdrive_helper import get_csv_from_gdrive
 
@@ -673,7 +673,7 @@ def main(argv=None):
     parser.add_argument("--csv", help="local CSV file or directory; overrides CSV_SOURCE")
     parser.add_argument("--source", choices=("local", "gdrive"),
                         help="override CSV_SOURCE for this report")
-    parser.add_argument("--gdrive-folder", help="override GDRIVE_FOLDER_FEEDBAC_REPORT")
+    parser.add_argument("--gdrive-folder", help="override GDRIVE_FOLDER_FEEDBACK_REPORT")
     parser.add_argument("--table", default=os.getenv("TABLE_FEEDBACK_REPORT") or DEFAULT_TABLE,
                         help="target table (default: TABLE_FEEDBACK_REPORT from Zenoti/.env)")
     parser.add_argument("--dry-run", action="store_true", help="validate source CSVs; no DB")

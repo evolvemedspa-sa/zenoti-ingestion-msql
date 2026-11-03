@@ -203,7 +203,7 @@ for csv_path in csv_paths:
         if norm_csv in sql_column_lookup:
             mapping[csv_col] = sql_column_lookup[norm_csv]
 
-    df.rename(columns=mapping, inplace=True)
+    df = df.rename(columns=mapping)
 
     # ==================================
     # Add Metadata Columns (per-file)
