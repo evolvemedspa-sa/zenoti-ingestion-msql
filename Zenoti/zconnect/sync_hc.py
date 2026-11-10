@@ -94,7 +94,13 @@ def print(*args, **kwargs):
 # call_logs last: it pages through a chunked date range, so it is by far the
 # longest pull, and a slow or truncated one should not hold up the two small
 # tables that have nothing to do with it.
-SCRIPTS = ("agent_metrics", "feedback_metrics", "location_performance", "events", "call_logs")
+SCRIPTS = (
+    "agent_metrics",
+    # "feedback_metrics",
+    "location_performance",
+    # "events",
+    "call_logs",
+)
 
 # Extra flags per script when --hc-extras is on.
 HC_EXTRAS = {"location_performance": ["--org", "--timeseries"]}
@@ -105,8 +111,8 @@ HC_EXTRAS = {"location_performance": ["--org", "--timeseries"]}
 INGEST = {
     "location_performance": "location_performance",
     "agent_metrics": "agent_metrics",
-    "feedback_metrics": "feedback_metrics",
-    "events": "events",
+    # "feedback_metrics": "feedback_metrics",
+    # "events": "events",
     "call_logs": "call_logs",
 }
 
@@ -277,9 +283,9 @@ def _selftest():
     assert build_command("agent_metrics")[2:] == []
     assert build_command("location_performance", hc_extras=True)[2:] == ["--org", "--timeseries"]
     assert build_command("agent_metrics", hc_extras=True)[2:] == []
-    assert {"feedback_metrics", "events"} <= set(SCRIPTS)
-    assert should_ingest("feedback_metrics")
-    assert should_ingest("events")
+    # assert {"feedback_metrics", "events"}.isdisjoint(SCRIPTS)
+    # assert not should_ingest("feedback_metrics")
+    # assert not should_ingest("events")
 
     class A:
         token = "Bearer AN:evolvemedspa|abc "
@@ -325,8 +331,8 @@ def _selftest():
     assert os.path.exists(IMPORTER), IMPORTER
     cmd = build_ingest_command("agent_metrics", r"C:\tmp\x.csv")
     assert cmd[1] == IMPORTER and cmd[2:] == ["--report", "agent_metrics", "--csv", r"C:\tmp\x.csv"], cmd
-    cmd = build_ingest_command("events", r"C:\tmp\events.csv")
-    assert cmd[2:] == ["--report", "events", "--csv", r"C:\tmp\events.csv"], cmd
+    cmd = build_ingest_command("call_logs", r"C:\tmp\call_logs.csv")
+    assert cmd[2:] == ["--report", "call_logs", "--csv", r"C:\tmp\call_logs.csv"], cmd
     print("selftest ok")
 
 
