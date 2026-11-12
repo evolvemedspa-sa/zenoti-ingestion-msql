@@ -201,6 +201,17 @@ class ServiceTests(unittest.TestCase):
             api_client.wait_for_request_slot()
         sleep.assert_called_once_with(0.75)
 
+    def test_fetch_progress_reads_throttle_from_api_helper(self):
+        with patch.object(listing, 'ThreadPoolExecutor') as executor, \
+                patch.object(listing, 'as_completed', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            executor.return_value.__enter__.return_value.submit.return_value = MagicMock()
+            snapshot = listing.fetch(
+                date(2026, 10, 12), date(2026, 11, 11), [4],
+                [('center-id', 'Center')], workers=1)
+        self.assertIn('1.0s minimum gap', output.getvalue())
+        self.assertEqual(snapshot['completed_jobs'], 2)
+
     def test_main_reports_runner_has_no_order_writers(self):
         path = Path(__file__).resolve().parents[2] / 'run_all.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))

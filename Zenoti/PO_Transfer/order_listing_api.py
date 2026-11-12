@@ -326,7 +326,7 @@ def fetch(start, end, criteria, centers, *, cache_dir=None, resume=False, worker
             for criterion in criteria]
     records, failures = [], []
     print(f'  API      {len(jobs):,} requests across {len(centers)} centers '
-          f'| {purchase_order.MIN_REQUEST_INTERVAL_SECONDS:.1f}s minimum gap', flush=True)
+          f'| {api_client.MIN_REQUEST_INTERVAL_SECONDS:.1f}s minimum gap', flush=True)
     progress_every = max(1, (len(jobs) + 3) // 4)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(fetch_cached_job, job, cache_dir, resume): job for job in jobs}
