@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import shutil
+import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -305,6 +306,7 @@ def upsert_rows(csv_rows, target, *, connection=None, commit=True):
         connection = get_connection()
     connection.timeout = 120
     cursor = connection.cursor()
+    stage = None
     try:
         cursor.execute('SET XACT_ABORT ON; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;')
         metadata = describe_target(cursor, target)
@@ -313,7 +315,10 @@ def upsert_rows(csv_rows, target, *, connection=None, commit=True):
         columns = [quote_identifier(metadata[column]['name']) for column in LOAD_COLUMNS]
         column_list = ','.join(columns)
         ref = columns[0]
-        stage = '#ZenotiOrdersStage'
+        # A uniquely named global temp table avoids an Azure SQL/ODBC issue where
+        # a local #table created by SELECT INTO can disappear between statements.
+        # The UUID prevents concurrent Railway runs from sharing staging rows.
+        stage = f'##ZenotiOrdersStage_{uuid.uuid4().hex}'
         cursor.execute(f'SELECT TOP (0) {column_list} INTO {stage} FROM {target}')
         # Bounded multi-row INSERTs avoid both SQL's 2,100-parameter limit and
         # legacy ODBC fast_executemany issues with local temporary tables.
@@ -384,6 +389,12 @@ def upsert_rows(csv_rows, target, *, connection=None, commit=True):
         connection.rollback()
         raise
     finally:
+        if stage:
+            try:
+                cursor.execute(
+                    f"IF OBJECT_ID('tempdb..{stage}') IS NOT NULL DROP TABLE {stage}")
+            except (pyodbc.Error, RuntimeError):
+                pass
         cursor.close()
         if owns_connection:
             connection.close()

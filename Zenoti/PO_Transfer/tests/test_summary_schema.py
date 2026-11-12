@@ -82,7 +82,7 @@ class SummarySchemaTests(unittest.TestCase):
             report = orders.upsert_rows(iter([PO2946]), '[dbo].[SummaryFixture]',
                                         connection=connection, commit=False)
         staged = next(call.args[1] for call in cursor.execute.call_args_list
-                      if call.args[0].startswith('INSERT INTO #ZenotiOrdersStage'))
+                      if call.args[0].startswith('INSERT INTO ##ZenotiOrdersStage_'))
         values = dict(zip(orders.LOAD_COLUMNS, staged))
         self.assertEqual(values['ref_no'], '2946')
         self.assertEqual(values['deliver_on'], '2026-11-09 17:10:00')

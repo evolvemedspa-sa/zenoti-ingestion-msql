@@ -299,8 +299,11 @@ def fetch_cached_job(job, cache_dir=None, resume=False):
             if not transient or attempt == 3:
                 raise
             delay = 30 * attempt
-            print(f'  Retrying {job[0]}, {job[2][1]}, {job[3]}..{job[4]}, '
-                  f'criterion {job[5]} in {delay}s.', flush=True)
+            reason = 'quota' if 'http 429' in message else 'transient error'
+            criterion = CRITERIA_LABELS.get(job[5], str(job[5]))
+            center = job[2][1] or 'configured center'
+            print(f'  API      {reason}: {job[0]} | {center} | {criterion} '
+                  f'| retry {attempt + 1}/3 in {delay}s', flush=True)
             time.sleep(delay)
     if cache_path is not None:
         temporary = cache_path.with_suffix('.tmp')
@@ -322,7 +325,8 @@ def fetch(start, end, criteria, centers, *, cache_dir=None, resume=False, worker
             for lo, hi in purchase_order.split_range(start, end)
             for criterion in criteria]
     records, failures = [], []
-    print(f'  API      {len(jobs):,} requests across {len(centers)} centers', flush=True)
+    print(f'  API      {len(jobs):,} requests across {len(centers)} centers '
+          f'| {purchase_order.MIN_REQUEST_INTERVAL_SECONDS:.1f}s minimum gap', flush=True)
     progress_every = max(1, (len(jobs) + 3) // 4)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(fetch_cached_job, job, cache_dir, resume): job for job in jobs}

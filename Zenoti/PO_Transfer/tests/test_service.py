@@ -193,6 +193,14 @@ class ServiceTests(unittest.TestCase):
                 if source == 'transfer':
                     self.assertEqual(params['show_delivery_details'], 'true')
 
+    def test_api_requests_have_a_shared_minimum_gap(self):
+        with patch.object(api_client, '_next_request_at', 0.0), \
+                patch.object(api_client.time, 'monotonic', side_effect=[100.0, 100.25]), \
+                patch.object(api_client.time, 'sleep') as sleep:
+            api_client.wait_for_request_slot()
+            api_client.wait_for_request_slot()
+        sleep.assert_called_once_with(0.75)
+
     def test_main_reports_runner_has_no_order_writers(self):
         path = Path(__file__).resolve().parents[2] / 'run_all.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))

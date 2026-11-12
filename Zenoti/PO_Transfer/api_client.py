@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,21 @@ else:
 
 load_environment()
 NY_TZ = ZoneInfo('America/New_York')
+MIN_REQUEST_INTERVAL_SECONDS = 1.0
+_request_lock = threading.Lock()
+_next_request_at = 0.0
+
+
+def wait_for_request_slot():
+    """Serialize API calls and leave a small account-wide gap between them."""
+    global _next_request_at
+    with _request_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_request_at - now)
+        if wait:
+            time.sleep(wait)
+            now += wait
+        _next_request_at = now + MIN_REQUEST_INTERVAL_SECONDS
 
 
 def parse_ymd(text, flag):
@@ -130,13 +146,13 @@ class InventoryEndpoint:
         last_error = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                wait_for_request_slot()
                 response = session.get(self.ENDPOINT, params=params, timeout=self.REQUEST_TIMEOUT)
             except requests.RequestException as error:
                 last_error = f'{type(error).__name__}: {error}'
                 if attempt == self.MAX_RETRIES:
                     break
                 delay = self.RETRY_BACKOFF_SECONDS * attempt
-                print(f'  {last_error} - retrying in {delay}s', flush=True)
                 time.sleep(delay)
                 continue
             if response.status_code == 200:
@@ -149,7 +165,6 @@ class InventoryEndpoint:
                 if attempt == self.MAX_RETRIES:
                     break
                 delay = self.RETRY_BACKOFF_SECONDS * attempt
-                print(f'  {last_error} - retrying in {delay}s', flush=True)
                 time.sleep(delay)
                 continue
             raise ValueError(f'Zenoti rejected the request (HTTP {response.status_code}). '
