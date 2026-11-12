@@ -1,19 +1,16 @@
 """Capture one Railway run and upload its concise log to Google Drive."""
 
-import json
 import os
 import sys
 import tempfile
 from pathlib import Path
 
-import requests
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
-
-
 LOG_FILENAME = 'po_and_transfer_logs.txt'
-DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files'
-DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
+
+if __package__:
+    from .gdrive_helper import upload_file_to_gdrive
+else:
+    from gdrive_helper import upload_file_to_gdrive
 
 
 class _Tee:
@@ -46,48 +43,21 @@ class LogSession:
         folder_id = os.getenv('GDRIVE_PARENT_FOLDER')
         credentials_json = os.getenv('GDRIVE_CREDENTIALS_JSON')
         credentials_file = os.getenv('GDRIVE_CREDENTIALS_FILE')
+        oauth_token = os.getenv('GOOGLE_TOKEN_JSON')
         if not folder_id:
             print('  Log      Drive upload skipped (GDRIVE_PARENT_FOLDER is not set).', flush=True)
             return False
-        if not credentials_json and not credentials_file:
+        if not credentials_json and not credentials_file and not oauth_token:
             print('  Log      Drive upload skipped (credentials are not set).', flush=True)
             return False
 
         try:
             self._handle.flush()
-            credentials = _credentials(credentials_json, credentials_file)
-            credentials.refresh(Request())
-            metadata = {'name': LOG_FILENAME, 'parents': [folder_id]}
-            boundary = 'po_transfer_log_upload'
-            body = (
-                f'--{boundary}\r\n'
-                'Content-Type: application/json; charset=UTF-8\r\n\r\n'
-                f'{json.dumps(metadata)}\r\n'
-                f'--{boundary}\r\n'
-                'Content-Type: text/plain; charset=UTF-8\r\n\r\n'
-            ).encode('utf-8') + self.path.read_bytes() + f'\r\n--{boundary}--'.encode('utf-8')
-            response = requests.post(
-                DRIVE_UPLOAD_API,
-                params={
-                    'uploadType': 'multipart', 'fields': 'id,name',
-                    'supportsAllDrives': 'true',
-                },
-                headers={
-                    'Authorization': f'Bearer {credentials.token}',
-                    'Content-Type': f'multipart/related; boundary={boundary}',
-                },
-                data=body,
-                timeout=60,
+            upload_file_to_gdrive(
+                str(self.path), folder_id,
+                credentials_json=credentials_json,
+                credentials_file=credentials_file,
             )
-            if response.status_code == 404:
-                raise ValueError(
-                    'parent Drive folder was not found or is not shared with the '
-                    'service-account email')
-            if response.status_code == 403:
-                raise ValueError(
-                    'service account does not have permission to write to the '
-                    'parent Drive folder')
-            response.raise_for_status()
             print(f'  Log      uploaded to Drive: {LOG_FILENAME}', flush=True)
             return True
         except Exception as error:  # best effort: SQL/API outcome remains authoritative
@@ -106,19 +76,6 @@ class LogSession:
             self.path.parent.rmdir()
         except OSError:
             pass
-
-
-def _credentials(credentials_json, credentials_file):
-    if credentials_json:
-        info = json.loads(credentials_json)
-        return service_account.Credentials.from_service_account_info(
-            info, scopes=[DRIVE_SCOPE])
-    path = Path(credentials_file)
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parent / path
-    return service_account.Credentials.from_service_account_file(
-        path, scopes=[DRIVE_SCOPE])
-
 
 def start():
     """Tee stdout and stderr to a temporary po_and_transfer_logs.txt."""

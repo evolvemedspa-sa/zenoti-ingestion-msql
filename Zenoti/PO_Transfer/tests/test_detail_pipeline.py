@@ -82,15 +82,25 @@ class DetailPipelineTests(unittest.TestCase):
 
     def test_all_three_loads_share_one_commit(self):
         connection = MagicMock()
+        order = []
         details = orders.prepare_details([
             api_record('purchase', '2946'), api_record('transfer', '7501')])
         targets = {'purchase': '[dbo].[Purchase]', 'transfer': '[dbo].[Transfer]'}
+        def summary_load(*args, **kwargs):
+            order.append('summary')
+            return {'committed': False, 'inserted': 0, 'updated': 2}
+        def purchase_load(*args, **kwargs):
+            order.append('purchase')
+            return 2
+        def transfer_load(*args, **kwargs):
+            order.append('transfer')
+            return 2
         with patch.object(orders, 'get_connection', return_value=connection), \
-                patch.object(orders, 'upsert_rows', return_value={
-                    'committed': False, 'inserted': 0, 'updated': 2,
-                }) as summary, \
-                patch.object(orders.purchase_details, 'load_to_sql', return_value=2) as purchase, \
-                patch.object(orders.transfer_details, 'load_to_sql', return_value=2) as transfer, \
+                patch.object(orders, 'upsert_rows', side_effect=summary_load) as summary, \
+                patch.object(orders.purchase_details, 'load_to_sql',
+                             side_effect=purchase_load) as purchase, \
+                patch.object(orders.transfer_details, 'load_to_sql',
+                             side_effect=transfer_load) as transfer, \
                 contextlib.redirect_stdout(io.StringIO()):
             report = orders.load_all_tables([], '[dbo].[Summary]', details, targets)
         self.assertIs(summary.call_args.kwargs['connection'], connection)
@@ -105,6 +115,7 @@ class DetailPipelineTests(unittest.TestCase):
         connection.rollback.assert_not_called()
         connection.close.assert_called_once_with()
         self.assertTrue(report['committed'])
+        self.assertEqual(order, ['summary', 'purchase', 'transfer'])
 
     def test_transfer_failure_rolls_back_the_summary_and_purchase_load(self):
         connection = MagicMock()

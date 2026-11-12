@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from PO_Transfer import api_client, order_listing_api as listing
-from PO_Transfer import po_and_transfers_api as orders, run_all, service_log
+from PO_Transfer import gdrive_helper, po_and_transfers_api as orders, run_all, service_log
 
 
 DATE_VARIABLES = (
@@ -120,42 +120,62 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / service_log.LOG_FILENAME
             path.write_text('short useful log\n', encoding='utf-8')
-            handle, credentials, response = MagicMock(), MagicMock(), MagicMock()
-            credentials.token = 'access-token'
+            handle = MagicMock()
             session = service_log.LogSession(path, handle, sys.stdout, sys.stderr)
             with patch.dict(os.environ, {
                     'GDRIVE_PARENT_FOLDER': 'parent-folder-id',
                     'GDRIVE_CREDENTIALS_JSON': '{"credential": "placeholder"}',
                     'GDRIVE_CREDENTIALS_FILE': '',
                 }, clear=False), \
-                    patch.object(service_log, '_credentials', return_value=credentials), \
-                    patch.object(service_log.requests, 'post', return_value=response) as post, \
+                    patch.object(service_log, 'upload_file_to_gdrive',
+                                 return_value='file-id') as upload, \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertTrue(session.upload())
 
-            credentials.refresh.assert_called_once()
-            response.raise_for_status.assert_called_once_with()
-            request = post.call_args.kwargs
-            self.assertIn(service_log.LOG_FILENAME.encode(), request['data'])
-            self.assertIn(b'parent-folder-id', request['data'])
-            self.assertEqual(request['headers']['Authorization'], 'Bearer access-token')
+            self.assertEqual(upload.call_args.args[1], 'parent-folder-id')
+            self.assertEqual(upload.call_args.kwargs['credentials_json'],
+                             '{"credential": "placeholder"}')
 
-    def test_drive_404_explains_folder_id_or_sharing_problem(self):
+    def test_drive_helper_failure_is_reported_without_failing_job(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / service_log.LOG_FILENAME
             path.write_text('log\n', encoding='utf-8')
-            credentials, response = MagicMock(), MagicMock(status_code=404)
-            credentials.token = 'access-token'
             session = service_log.LogSession(path, MagicMock(), sys.stdout, sys.stderr)
             with patch.dict(os.environ, {
                     'GDRIVE_PARENT_FOLDER': 'bad-or-unshared-folder',
                     'GDRIVE_CREDENTIALS_JSON': '{}',
                 }, clear=False), \
-                    patch.object(service_log, '_credentials', return_value=credentials), \
-                    patch.object(service_log.requests, 'post', return_value=response), \
+                    patch.object(service_log, 'upload_file_to_gdrive',
+                                 side_effect=ValueError('folder unavailable')), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertFalse(session.upload())
-            self.assertIn('not found or is not shared', output.getvalue())
+            self.assertIn('folder unavailable', output.getvalue())
+
+    def test_drive_helper_uses_oauth_fallback_for_inaccessible_service_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / service_log.LOG_FILENAME
+            path.write_text('log\n', encoding='utf-8')
+            response = MagicMock(status_code=404, text='not found')
+            session = MagicMock()
+            session.post.return_value = response
+            with patch.object(gdrive_helper, '_get_authed_session', return_value=session), \
+                    patch.object(gdrive_helper, '_upload_via_oauth',
+                                 return_value='oauth-file-id') as fallback:
+                result = gdrive_helper.upload_file_to_gdrive(
+                    str(path), 'parent-folder', credentials_json='{}')
+            self.assertEqual(result, 'oauth-file-id')
+            fallback.assert_called_once_with(str(path), 'parent-folder')
+
+    def test_drive_helper_can_use_oauth_without_service_account_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / service_log.LOG_FILENAME
+            path.write_text('log\n', encoding='utf-8')
+            with patch.object(gdrive_helper, '_upload_via_oauth',
+                              return_value='oauth-file-id') as fallback:
+                result = gdrive_helper.upload_file_to_gdrive(
+                    str(path), 'parent-folder')
+            self.assertEqual(result, 'oauth-file-id')
+            fallback.assert_called_once_with(str(path), 'parent-folder')
 
     def test_railway_cleanup_removes_only_generated_run_files(self):
         with tempfile.TemporaryDirectory() as directory:

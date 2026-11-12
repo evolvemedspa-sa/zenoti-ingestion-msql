@@ -3,4 +3,5 @@ pyodbc
 python-dotenv
 requests
 google-auth
+google-api-python-client
 tzdata

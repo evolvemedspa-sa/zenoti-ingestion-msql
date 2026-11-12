@@ -214,9 +214,12 @@ def load_all_tables(rows, summary_target, details, targets):
     """Commit the summary and both detail replacements as one SQL transaction."""
     connection = get_connection()
     try:
+        print('  SQL 1/3  order summary', flush=True)
         report = upsert_rows(rows, summary_target, connection=connection, commit=False)
         outputs = {}
-        for source, module in (('purchase', purchase_details), ('transfer', transfer_details)):
+        for step, (source, module) in enumerate((
+                ('purchase', purchase_details), ('transfer', transfer_details)), start=2):
+            print(f'  SQL {step}/3  {source} details', flush=True)
             data = details[source]
             count = module.load_to_sql(
                 data['rows'], replace=True, table=targets[source], connection=connection,
