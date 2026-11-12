@@ -127,7 +127,13 @@ def inspect_target(target):
     connection.timeout = 60
     try:
         cursor = connection.cursor()
-        metadata = describe_target(cursor, target)
+        try:
+            metadata = describe_target(cursor, target)
+        except ValueError as error:
+            if str(error).startswith('Table not found:'):
+                raise ValueError(
+                    'Summary SQL destination was not found or is not accessible.') from error
+            raise
         cursor.execute(f'SELECT COUNT_BIG(*) FROM {target}')
         count = _fetch_sql_integer(cursor)
         print(f'  SQL      summary ready | {count:,} existing rows '
@@ -168,7 +174,14 @@ def inspect_details(targets):
     try:
         for source, module in (('purchase', purchase_details), ('transfer', transfer_details)):
             target = targets[source]
-            detail_sql.inspect_target(cursor, target, module.LINE_ITEM_COLUMNS)
+            try:
+                detail_sql.inspect_target(cursor, target, module.LINE_ITEM_COLUMNS)
+            except ValueError as error:
+                if str(error).startswith('Table not found:'):
+                    raise ValueError(
+                        f'{source.title()} detail SQL destination was not found or '
+                        'is not accessible.') from error
+                raise
             print(f'  SQL      {source} details ready | '
                   f'{len(module.LINE_ITEM_COLUMNS)} fields', flush=True)
     finally:

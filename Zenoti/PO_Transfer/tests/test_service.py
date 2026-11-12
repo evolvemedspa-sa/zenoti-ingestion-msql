@@ -140,6 +140,23 @@ class ServiceTests(unittest.TestCase):
             self.assertIn(b'parent-folder-id', request['data'])
             self.assertEqual(request['headers']['Authorization'], 'Bearer access-token')
 
+    def test_drive_404_explains_folder_id_or_sharing_problem(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / service_log.LOG_FILENAME
+            path.write_text('log\n', encoding='utf-8')
+            credentials, response = MagicMock(), MagicMock(status_code=404)
+            credentials.token = 'access-token'
+            session = service_log.LogSession(path, MagicMock(), sys.stdout, sys.stderr)
+            with patch.dict(os.environ, {
+                    'GDRIVE_PARENT_FOLDER': 'bad-or-unshared-folder',
+                    'GDRIVE_CREDENTIALS_JSON': '{}',
+                }, clear=False), \
+                    patch.object(service_log, '_credentials', return_value=credentials), \
+                    patch.object(service_log.requests, 'post', return_value=response), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(session.upload())
+            self.assertIn('not found or is not shared', output.getvalue())
+
     def test_railway_cleanup_removes_only_generated_run_files(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / '2026-10-12_to_2026-11-11'

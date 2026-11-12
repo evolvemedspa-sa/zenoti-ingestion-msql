@@ -68,7 +68,10 @@ class LogSession:
             ).encode('utf-8') + self.path.read_bytes() + f'\r\n--{boundary}--'.encode('utf-8')
             response = requests.post(
                 DRIVE_UPLOAD_API,
-                params={'uploadType': 'multipart', 'fields': 'id,name'},
+                params={
+                    'uploadType': 'multipart', 'fields': 'id,name',
+                    'supportsAllDrives': 'true',
+                },
                 headers={
                     'Authorization': f'Bearer {credentials.token}',
                     'Content-Type': f'multipart/related; boundary={boundary}',
@@ -76,6 +79,14 @@ class LogSession:
                 data=body,
                 timeout=60,
             )
+            if response.status_code == 404:
+                raise ValueError(
+                    'parent Drive folder was not found or is not shared with the '
+                    'service-account email')
+            if response.status_code == 403:
+                raise ValueError(
+                    'service account does not have permission to write to the '
+                    'parent Drive folder')
             response.raise_for_status()
             print(f'  Log      uploaded to Drive: {LOG_FILENAME}', flush=True)
             return True
