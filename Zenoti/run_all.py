@@ -31,17 +31,11 @@ SCRIPTS = [
     # slowest step, so a failure here should not hold up the other loads.
     "stock_inventory.py",
     # This fetches the rolling birthday window and refreshes those guest keys in
-    # SQL. Run it after the other database loads, before the final order import.
+    # SQL. Run it after the other database loads.
     "get_guest_birthday_v3.py",
-    # po_and_transfers.py runs last: it loads the order-level CSV and then chains
-    # the Zenoti API pulls for purchase_order.py / transfer_order.py, so it is the
-    # longest step and depends on a live API.
-    "po_and_transfers.py",
 ]
-
-# The order import is independent of the other loads, so its failure is logged
-# without stopping the run or marking the pipeline failed.
-NON_BLOCKING = {"po_and_transfers.py"}
+# The separate PO_Transfer/run_all.py Railway service runs the order summary
+# and both purchase/transfer product-detail loaders.
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_dir = os.path.join(script_dir, "logs")
@@ -54,7 +48,6 @@ log_path = os.path.join(log_dir, log_filename)
 start_time = datetime.now()
 all_passed = True
 failed_script = None
-failed_non_blocking = []
 
 
 def log(msg):
@@ -94,11 +87,6 @@ for script in SCRIPTS:
     elapsed = (datetime.now() - script_start).total_seconds()
 
     if result.returncode != 0:
-        if script in NON_BLOCKING:
-            log(f"[FAILED] {script} (exit code {result.returncode}, {elapsed:.1f}s) "
-                "- non-blocking, continuing")
-            failed_non_blocking.append(script)
-            continue
         log(f"[FAILED] {script} (exit code {result.returncode}, {elapsed:.1f}s)")
         all_passed = False
         failed_script = script
@@ -108,10 +96,7 @@ for script in SCRIPTS:
 
 total_elapsed = (datetime.now() - start_time).total_seconds()
 
-if all_passed and failed_non_blocking:
-    log(f"Pipeline complete with non-blocking failures: "
-        f"{', '.join(failed_non_blocking)}. Total time: {total_elapsed:.1f}s")
-elif all_passed:
+if all_passed:
     log(f"Pipeline complete. Total time: {total_elapsed:.1f}s")
 else:
     log(f"Pipeline stopped at {failed_script}. Total time: {total_elapsed:.1f}s")
