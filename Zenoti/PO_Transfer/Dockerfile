@@ -10,8 +10,8 @@ RUN apt-get update && \
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-COPY requirements.txt .
+COPY Zenoti/PO_Transfer/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY Zenoti/PO_Transfer/ ./
 
 CMD ["python", "-u", "run_all.py"]

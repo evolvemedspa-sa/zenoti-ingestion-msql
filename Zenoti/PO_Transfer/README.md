@@ -20,9 +20,9 @@ Create a separate scheduled Railway service from this repository:
 
 | Setting | Value |
 | --- | --- |
-| Root Directory | `/Zenoti/PO_Transfer` |
+| Root Directory | Leave blank (repository root) |
 | Builder | Dockerfile |
-| Dockerfile Path | Leave the default; `Dockerfile` is detected in the service root |
+| Dockerfile Path | `Zenoti/PO_Transfer/Dockerfile` |
 | Start Command | `python -u run_all.py` (also the image default) |
 | Restart Policy | Never, for this scheduled batch job |
 | Cron Schedule | Set the daily time you want; Railway cron uses UTC |
