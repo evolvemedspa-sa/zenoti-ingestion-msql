@@ -9,8 +9,9 @@
 # Dockerfile Path zconnect/Dockerfile.
 FROM python:3.12-slim-bookworm
 
+# Playwright's bundled Node needs libatomic before it can install browser deps.
 RUN apt-get update && \
-    apt-get install -y curl gnupg2 apt-transport-https unixodbc unixodbc-dev && \
+    apt-get install -y curl gnupg2 apt-transport-https unixodbc unixodbc-dev libatomic1 && \
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
     echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && \
