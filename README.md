@@ -217,6 +217,30 @@ replaces rows by `centerid`, `event_id`, and `send_date`. The events destination
 exist and defaults to `dbo.BRONZE_ZENOTI_EVENTS_REVIEWS`; `TABLE_HC_EVENTS` in
 `Zenoti/.env` can override it.
 
+## Call Log ID Capacity
+
+HyperConnect can return composite call IDs containing a call SID and a GUID,
+which are 71 characters long. A `CALL_ID` column sized at 50 or 64 characters
+rejects those rows before the loader writes anything. Keep the full ID: it is
+the key used to replace each call on a later import.
+
+The schema helper widens an existing `varchar` or `nvarchar` `CALL_ID` to 128
+characters while preserving its type, nullability and indexes. It leaves
+columns already at least 128 characters, including `MAX`, alone. Preview and
+apply the fix from the repository root:
+
+```powershell
+python Zenoti\zconnect\hc_sql_helper\fix_hc_tables.py --report call_logs
+python Zenoti\zconnect\hc_sql_helper\fix_hc_tables.py --report call_logs --apply
+```
+
+Then load the retained CSV on the machine where the failed sync ran, passing
+its actual path:
+
+```powershell
+python Zenoti\zconnect\hc_sql_helper\import_hc_report.py --report call_logs --csv path\to\call_logs.csv
+```
+
 ## Verification
 
 After running `stock_inventory.py`, check the load with:

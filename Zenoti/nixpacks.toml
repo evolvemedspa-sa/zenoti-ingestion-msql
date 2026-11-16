@@ -1,3 +1,6 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.12"
+
 [phases.setup]
 aptPkgs = ["unixodbc", "unixodbc-dev", "odbcinst", "gnupg2", "curl", "apt-transport-https"]
 

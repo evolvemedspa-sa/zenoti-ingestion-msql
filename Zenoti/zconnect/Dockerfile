@@ -7,7 +7,7 @@
 # on sys.path to import db_helper. A context of zconnect/ alone would break
 # every load with an ImportError. On Railway: Root Directory Zenoti,
 # Dockerfile Path zconnect/Dockerfile.
-FROM python:3.11-slim
+FROM python:3.12-slim-bookworm
 
 RUN apt-get update && \
     apt-get install -y curl gnupg2 apt-transport-https unixodbc unixodbc-dev && \

@@ -9,7 +9,7 @@ What it fixes, and only these three things:
   * a key column the table does not have at all. The loader refuses to load
     without one (nothing would be recognised as already there, so every run
     would re-insert everything), so this is what unblocks it.
-  * a key column whose type cannot hold the data. Two real cases, both AGENT_ID:
+  * a column whose type cannot hold the data. Two real cases, both AGENT_ID:
     on call logs it is uniqueidentifier and the voicebot agents come back as
     `agent_2401k7mc4rfbfvtvw1a3nbk6pvwd` -- 186 of 11069 rows; on agent metrics
     it is uniqueidentifier too and 64 of 1148 rows carry `agent_4001k7mbg...`.
@@ -19,6 +19,10 @@ What it fixes, and only these three things:
     ("the index is dependent on column"), so that index is dropped first and
     recreated with the same name and columns straight afterwards -- see
     plan(). A column in the PRIMARY KEY is reported instead, never dropped.
+    CALL_ID also needs room for composite IDs: 'CA' + 32 hex + '_' + a GUID
+    is 71 characters. Existing varchar/nvarchar columns shorter than 128 are
+    widened in place, preserving their type, nullability and indexes, including
+    a primary key. Columns already at least 128 characters or MAX are left alone.
   * a unique index on the key. The dedup in import_hc_report.py is an index seek
     per row with one and a full scan per row without, and the index is also the
     only thing stopping two overlapping runs from both inserting the same row.
@@ -50,11 +54,10 @@ _WORKDIR = os.path.dirname(_HERE)                            # zconnect/
 _ROOT = os.path.dirname(_WORKDIR)                            # Zenoti/
 
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.join(_ROOT, "dbquery"))
 
 import pyodbc  # noqa: E402
 from db_helper import get_connection  # noqa: E402
-import import_aesthetix_opportunity_history as base  # noqa: E402
+import csv_table as base  # noqa: E402
 import import_hc_report as ihr  # noqa: E402  (its REPORTS table, and .env loading)
 
 # Types for key columns that have to be added, hand-declared from the sample
@@ -69,7 +72,7 @@ ADD_TYPE = {
     "center_id": "uniqueidentifier",
     "centerid": "uniqueidentifier",
     "agent_id": "nvarchar(64)",
-    "call_id": "nvarchar(64)",   # 'CA' + 32 hex, 34 chars -- not a GUID
+    "call_id": "nvarchar(128)",  # also 'CA' + 32 hex + '_' + a GUID (71 chars)
     "event_id": "nvarchar(64)",
     "send_date": "datetime2",
 }
@@ -80,6 +83,11 @@ RETYPE = {
     "call_logs": {"agent_id": ("uniqueidentifier", "nvarchar(64)")},
     "agent_metrics": {"agent_id": ("uniqueidentifier", "nvarchar(64)")},
 }
+
+# Increase capacity without changing the live character type. Unlike a type
+# conversion, SQL Server permits increasing varchar/nvarchar length on an
+# indexed column, so CALL_ID's primary key and other indexes stay in place.
+WIDEN = {"call_logs": {"call_id": 128}}
 
 
 def index_columns(cursor, schema, name):
@@ -161,7 +169,8 @@ def duplicate_keys(cursor, table, key_cols):
     return groups, counted - groups, tuple(cursor.fetchone())
 
 
-def plan(report, table, columns, col_types, indexes, primary_keys=None, not_null=None):
+def plan(report, table, columns, col_types, indexes, primary_keys=None, not_null=None,
+         lengths=None):
     """(statements, notes) to bring one table in line.
 
     `table` is passed in rather than read from REPORTS: the live name comes from
@@ -172,7 +181,7 @@ def plan(report, table, columns, col_types, indexes, primary_keys=None, not_null
 
     Pure, so the decision is testable without a server -- it is the part where a
     wrong answer silently writes schema. An empty `statements` means the table is
-    already right. The two optional maps are read from the server by main() and
+    already right. The optional metadata is read from the server by main() and
     left out entirely by the self-check that does not care about them.
     """
     spec = ihr.REPORTS[report]
@@ -180,6 +189,7 @@ def plan(report, table, columns, col_types, indexes, primary_keys=None, not_null
     statements, notes = [], []
     primary_keys = primary_keys or {}
     not_null = not_null or set()
+    lengths = lengths or {}
 
     by_norm = {base.normalize_col(c): c for c in columns}
     key_cols, missing = ihr.resolve_key(key, columns)
@@ -192,6 +202,20 @@ def plan(report, table, columns, col_types, indexes, primary_keys=None, not_null
         notes.append(f"add  {column} {kind}")
         statements.append(f"ALTER TABLE {table} ADD [{column}] {kind} NULL")
         key_cols.append(column)
+
+    for column, minimum in WIDEN.get(report, {}).items():
+        live = by_norm.get(base.normalize_col(column))
+        if not live:
+            continue
+        kind = (col_types.get(live) or "").lower()
+        capacity = lengths.get(live)
+        if kind not in ("varchar", "nvarchar") or capacity is None or capacity <= 0:
+            continue
+        if capacity >= minimum:
+            continue
+        suffix = " NOT NULL" if live in not_null else " NULL"
+        notes.append(f"widen {live} {kind}({capacity}) -> {kind}({minimum})")
+        statements.append(f"ALTER TABLE {table} ALTER COLUMN [{live}] {kind}({minimum}){suffix}")
 
     for column, (from_type, to_type) in RETYPE.get(report, {}).items():
         live = by_norm.get(base.normalize_col(column))
@@ -270,6 +294,34 @@ def self_check():
     covered = {"whatever_name": ["END_DATE", "START_DATE", "CENTER_ID"]}
     st, notes = plan("location_performance", lp, live, live_types, covered)
     assert st == [], (st, notes)
+
+    # The failed production payload carries a 71-character composite CALL_ID.
+    # Widen its existing type without dropping its primary key or other indexes.
+    call_id = "CA6df3d6c6b87dbc2d4475ba26cdc80a29_7c76bde7-aba2-4bb6-904e-2a30315a452f"
+    rows = [{"call_id": call_id}]
+    assert len(call_id) == 71
+    assert "CALL_ID" in base._validate_types(rows, ["CALL_ID"], {"CALL_ID": "varchar"},
+                                            {"CALL_ID": 50})
+    assert base._validate_types(rows, ["CALL_ID"], {"CALL_ID": "varchar"},
+                                {"CALL_ID": 128}) == {}
+    assert base._to_tuples(rows, ["CALL_ID"], {"CALL_ID": "varchar"}) == [(call_id,)]
+    call_pk = {"PK_CALL_LOGS": ["CALL_ID"]}
+    for kind, size in (("varchar", 50), ("nvarchar", 64)):
+        st, notes = plan("call_logs", cl, ["CALL_ID"], {"CALL_ID": kind}, call_pk,
+                         primary_keys=call_pk, not_null={"CALL_ID"}, lengths={"CALL_ID": size})
+        assert st == [f"ALTER TABLE {cl} ALTER COLUMN [CALL_ID] {kind}(128) NOT NULL"], st
+    # No shrinking; MAX, missing length metadata and unrelated types stay alone.
+    for kind, size in (("varchar", 128), ("nvarchar", 256), ("varchar", -1),
+                       ("nvarchar", None), ("varchar", None), ("char", 50)):
+        st, notes = plan("call_logs", cl, ["CALL_ID"], {"CALL_ID": kind}, call_pk,
+                         lengths={"CALL_ID": size})
+        assert st == [], (kind, size, st)
+    # Respect the table override, column spelling and nullable columns too.
+    st, _ = plan("call_logs", "dbo.OTHER_CALL_LOGS", ["Call_Id"], {"Call_Id": "varchar"},
+                 {"UX_CALL": ["Call_Id"]}, lengths={"Call_Id": 50})
+    assert st == ["ALTER TABLE dbo.OTHER_CALL_LOGS ALTER COLUMN [Call_Id] varchar(128) NULL"], st
+    st, _ = plan("call_logs", cl, [], {}, {})
+    assert st[0] == f"ALTER TABLE {cl} ADD [call_id] nvarchar(128) NULL", st
 
     # A unique index on only part of the key does not count.
     st, _ = plan("location_performance", lp, live, live_types, {"idx": ["CENTER_ID"]})
@@ -365,7 +417,7 @@ def main():
             spec = ihr.REPORTS[report]
             table = os.getenv(spec["env"]) or spec["table"]
             schema, name = base._split_table(table)
-            columns, _, col_types, _ = base._table_columns(cursor, schema, name)
+            columns, _, col_types, lengths = base._table_columns(cursor, schema, name)
             print(f"\n  {spec['label']}  ({table})")
 
             if not columns:
@@ -373,7 +425,7 @@ def main():
                 continue
             statements, notes = plan(report, table, columns, col_types, index_columns(cursor, schema, name),
                                      primary_key_columns(cursor, schema, name),
-                                     not_null_columns(cursor, schema, name))
+                                     not_null_columns(cursor, schema, name), lengths=lengths)
             print(f"          {len(columns)} column(s); key {', '.join(spec['key'])}")
 
             # Only worth asking about the data when the plan is to put a unique
