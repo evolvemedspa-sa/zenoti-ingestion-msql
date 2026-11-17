@@ -9,10 +9,12 @@ alone is not a success signal -- always go through `check_error`.
 """
 import csv
 import datetime
+import math
 import os
 import re
 import sys
 import time
+from email.utils import parsedate_to_datetime
 
 import requests
 from dotenv import load_dotenv
@@ -49,6 +51,7 @@ REQUEST_DELAY = float(os.getenv("ZENOTI_REQUEST_DELAY", "0.4"))
 # answer 200 moments later, so it is throttling, not a permission problem.
 # Retry both, backing off exponentially.
 THROTTLE_STATUSES = {403, 429}
+TRANSIENT_GET_STATUSES = {408, 500, 502, 503, 504}
 
 MAX_RETRIES = int(os.getenv("ZENOTI_MAX_RETRIES", "5"))
 
@@ -94,16 +97,39 @@ def check_error(payload, status_code):
     return payload
 
 
-def request(method, path, **kwargs):
-    """Call {BASE_URL}/v1{path}. Path includes the /v1 prefix, e.g. "/centers".
+def _wait_before_retry(path, attempt, reason, response=None):
+    """Back off, respecting Retry-After seconds or an HTTP date when supplied."""
+    wait = RETRY_BACKOFF_BASE * (2**attempt)
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    delay = 0
+            if math.isfinite(delay):
+                wait = max(wait, delay)
+        response.close()
+    print(
+        f"{reason} on {path} -- retry {attempt + 1}/{MAX_RETRIES} in {wait:.0f}s",
+        file=sys.stderr,
+    )
+    time.sleep(wait)
 
-    Retries two kinds of transient failure before giving up, with the same
-    exponential backoff: a throttled response (403/429), and a connection that
-    hangs or drops. The latter matters most on the multi-center sweeps -- under
-    sustained load the API stops answering rather than returning 429, and an
-    unretried ReadTimeout would abort the whole run partway through.
+
+def request(method, path, **kwargs):
+    """Call {BASE_URL}/v1{path}, e.g. "/centers".
+
+    Retry throttling and dropped connections. GETs also retry temporary server
+    errors and successful HTTP responses whose body is empty or invalid JSON.
+    A failed response is never treated as an empty dataset.
+    GET /feedbacks returning HTTP 204 is an empty native feedback lookup.
     """
     url = f"{BASE_URL}/v1{path}"
+    is_get = method.upper() == "GET"
     for attempt in range(MAX_RETRIES + 1):
         try:
             response = session.request(method, url, timeout=30, **kwargs)
@@ -113,32 +139,40 @@ def request(method, path, **kwargs):
                     f"{type(exc).__name__} on {path} after {MAX_RETRIES + 1} attempts -- "
                     f"the API stopped responding; rerun, or raise ZENOTI_MAX_RETRIES"
                 )
-            wait = RETRY_BACKOFF_BASE * (2**attempt)
-            print(
-                f"{type(exc).__name__} on {path} -- retry {attempt + 1}/{MAX_RETRIES} in {wait:.0f}s",
-                file=sys.stderr,
-            )
-            time.sleep(wait)
+            _wait_before_retry(path, attempt, type(exc).__name__)
             continue
 
-        if response.status_code in THROTTLE_STATUSES and attempt < MAX_RETRIES:
-            wait = RETRY_BACKOFF_BASE * (2**attempt)
-            print(
-                f"throttled ({response.status_code}) on {path} -- retry "
-                f"{attempt + 1}/{MAX_RETRIES} in {wait:.0f}s",
-                file=sys.stderr,
-            )
-            time.sleep(wait)
+        if (response.status_code in THROTTLE_STATUSES
+                or (is_get and response.status_code in TRANSIENT_GET_STATUSES)) and attempt < MAX_RETRIES:
+            _wait_before_retry(path, attempt, f"HTTP {response.status_code}", response)
             continue
-        break
 
-    try:
-        payload = response.json()
-    except ValueError:
+        if is_get and path == "/feedbacks" and response.status_code == 204:
+            # No Content is a successful empty lookup, not malformed JSON.
+            # Keep this specific to native details so an empty event-feed page
+            # cannot silently end pagination before all events are retrieved.
+            response.close()
+            group = (kwargs.get("params") or {}).get("appointment_group_id")
+            scope = f" (appointment_group_id={group})" if group else ""
+            print(f"HTTP 204 on /feedbacks: no feedback details{scope}", file=sys.stderr)
+            return {"feedback": [], "error": None}
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            detail = (
+                f"HTTP {response.status_code}, "
+                f"Content-Type={response.headers.get('Content-Type', '(missing)')}, "
+                f"body={response.text[:200]!r}"
+            )
+            if is_get and 200 <= response.status_code < 300 and attempt < MAX_RETRIES:
+                _wait_before_retry(path, attempt, f"non-JSON response ({detail})", response)
+                continue
+            raise ZConnectError(
+                f"non-JSON response from {url} after {attempt + 1} attempt(s):\n{detail}"
+            ) from exc
         response.raise_for_status()
-        raise ZConnectError(f"non-JSON response from {url}: {response.text[:200]}")
-    response.raise_for_status()
-    return check_error(payload, response.status_code)
+        return check_error(payload, response.status_code)
 
 
 def get(path, **params):
@@ -341,6 +375,7 @@ def hc_post(path, body):
     agent sweep makes one call per center, so one timeout would otherwise take
     down the whole run.
     """
+    response: requests.Response | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             response = hc_session().post(f"{HC_BASE_URL}{path}", json=body, timeout=90)
@@ -357,6 +392,9 @@ def hc_post(path, body):
                 file=sys.stderr,
             )
             time.sleep(wait)
+
+    if response is None:
+        raise ZConnectError("ZENOTI_MAX_RETRIES must be zero or positive.")
 
     try:
         payload = response.json()

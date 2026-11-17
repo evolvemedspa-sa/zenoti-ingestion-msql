@@ -1,8 +1,8 @@
 """Load a downloaded ZConnect events CSV into TABLE_HC_EVENTS.
 
 Usage:
-    python hc_ingestion/ingest_events.py path/to/zconnect_events.csv
-    python hc_ingestion/ingest_events.py path/to/zconnect_events.csv --dry-run
+    python Zenoti/zconnect/hc_ingestion_manual/ingest_events_old.py path/to/zconnect_events.csv
+    python Zenoti/zconnect/hc_ingestion_manual/ingest_events_old.py path/to/zconnect_events.csv --dry-run
 
 The destination table must already exist and include centerid, event_id, and
 send_date. The shared HC CSV loader validates SQL types and replaces rows by

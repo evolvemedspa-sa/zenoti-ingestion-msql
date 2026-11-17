@@ -198,24 +198,195 @@ SELECT
 FROM stock_inventory
 ```
 
-## ZConnect Feedback and Events CSV Loads
+## HyperConnect Sync
 
-`Zenoti/zconnect/sync_hc.py` now runs `feedback_metrics` and `events` alongside
-the other HyperConnect reports. Feedback metrics are loaded using
-`TABLE_HC_FEEDBACK` from `Zenoti/.env`; events are loaded using `TABLE_HC_EVENTS`.
+`Zenoti/zconnect/sync_hc.py` runs `agent_metrics`, `location_performance`,
+`events`, and `call_logs`. Review ingestion runs directly inside
+`sync_hc.py` and loads `TABLE_HC_EVENTS`. The other reports use
+`hc_sql_helper/import_hc_report.py`. `feedback_metrics` is currently disabled
+in the sync.
+The `events` report runs `get_events.py`; use `--only events` to select it.
 
-Previously downloaded CSVs can be loaded independently:
+Run these commands from the repository root:
 
 ```powershell
-python Zenoti\zconnect\hc_ingestion\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv" --dry-run
-python Zenoti\zconnect\hc_ingestion\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv"
-python Zenoti\zconnect\hc_ingestion\ingest_events.py "Zenoti\sample csv\zconnect_events_all_2025-01-01_2025-12-31.csv" --dry-run
+# Pull and load all enabled reports.
+python Zenoti\zconnect\sync_hc.py
+
+# Pull and load reviews only; uses ZENOTI_API_KEY and skips browser login.
+python Zenoti\zconnect\sync_hc.py --only events
+
+# Widen the review backfill to the previous 14 complete days.
+python Zenoti\zconnect\sync_hc.py --only events --lookback 14
+
+# Backfill an explicit date range.
+python Zenoti\zconnect\sync_hc.py --only events --start-date 2026-11-01 --end-date 2026-11-16
+
+# Export reviews to CSV without loading SQL.
+python Zenoti\zconnect\sync_hc.py --only events --no-ingest
 ```
 
-The feedback loader replaces rows by `center_id` and `date`; the events loader
-replaces rows by `centerid`, `event_id`, and `send_date`. The events destination must already
-exist and defaults to `dbo.BRONZE_ZENOTI_EVENTS_REVIEWS`; `TABLE_HC_EVENTS` in
-`Zenoti/.env` can override it.
+With no explicit dates, the sync fetches the previous **seven complete days**,
+ending yesterday (`--lookback 7 --t-minus 1`). For example, a run on
+**November 17, 2026 fetches November 10 through November 16, inclusive**.
+The date is taken from the machine running the script; the deployed container
+uses UTC. This overlapping window catches late-arriving data and updates to
+reviews loaded on previous runs. `--start-date`, `--end-date`, and
+`--center-id` are forwarded to the exporter.
+
+HyperConnect reports require a browser bearer token, captured once per run
+or supplied with `--token`. Reviews use `ZENOTI_API_KEY` from
+`Zenoti/.env`. A run with `--only events` needs no browser login.
+
+### Review SQL Ingestion
+
+The production review loader is built into `sync_hc.py`. Configure
+`TABLE_HC_EVENTS` and the shared SQL connection settings in `Zenoti/.env`.
+The destination must already have the **17 columns exported by `get_events.py`**
+plus `date_inserted datetime2(7)`, with a primary key or unique index on
+`review_key`. The loader validates the CSV, destination schema, and value
+capacity before writing. The former timeline CSV uses a different schema.
+
+Reviews are inserted or refreshed by `review_key` in one transaction. A
+failure rolls back the load. Reviews outside the CSV are retained, and older
+event versions cannot overwrite newer stored versions. Unicode text,
+whitespace, multiline and blank comments, and JSON are preserved.
+
+For a log such as:
+
+```text
+Ingested: 2 inserted, 3 refreshed, 1 older versions skipped.
+```
+
+| Count | Meaning |
+| --- | --- |
+| `inserted` | New `review_key` values were added, with a UTC `date_inserted`. |
+| `refreshed` | Existing rows were updated using an equal or newer event timestamp. Identical reviews fetched again can count as refreshed. |
+| `older versions skipped` | Incoming events were older than the stored review and were left out of the update. |
+
+Refreshes preserve the original `date_inserted`. The seven-day overlap
+therefore commonly refreshes previous records without creating duplicate
+reviews, while also capturing changed ratings, comments, or replies.
+
+During sync ingestion, CSVs are temporary hand-offs and are deleted after a
+successful load. A failed review load keeps `Zenoti/zconnect/events.csv`
+for inspection. `--no-ingest` leaves review exports in
+`Zenoti/zconnect/output/`. `--stop-on-error` stops the sync at the first
+failed pull or load.
+
+## Individual Review Export
+
+`Zenoti/zconnect/get_events.py` exports individual ratings, comments, reviewer
+names, review dates, sources, replies, and full review metadata to a local CSV.
+It uses `ZENOTI_API_KEY` and optional `ZENOTI_BASE_URL` from
+`Zenoti/.env`.
+
+The exporter reads
+`GET /v1/zconnect/centers/{center_id}/events?filter=feedback`. Google reviews
+come from event metadata. Submitted Zenoti feedback is followed through
+`GET /v1/feedbacks?appointment_group_id=...` and exported with
+`source=ZENOTI`. Native tags, invoice information, and separate rating
+dimensions are preserved in `metadata_json`. The native `rating` is
+`service_rating`; unanswered values (`-1`) are left blank.
+
+```powershell
+python Zenoti\zconnect\get_events.py --start-date 2026-01-01
+python Zenoti\zconnect\get_events.py --center-id cac21ac7-7925-418f-ae6e-1f3e8d45ca2b --start-date 2026-11-01 --end-date 2026-11-16
+python Zenoti\zconnect\get_events.py --start-date 2026-11-01 --end-date 2026-11-16 --csv reviews.csv
+python Zenoti\zconnect\get_events.py --dry-run
+```
+
+Running `get_events.py` directly defaults to all accessible centers from
+`2000-01-01` through today. The seven-day default belongs to `sync_hc.py`.
+`ZENOTI_REVIEW_START_DATE` and `ZENOTI_REVIEW_END_DATE` can override the
+standalone export defaults; general pipeline date settings are not used.
+
+Default output is
+`Zenoti/zconnect/output/reviews_<scope>_<start>_<end>.csv`; `--csv` selects
+another path. Every page is fetched in inclusive 10-day windows. An optional
+`--max-pages` cap aborts the export if it would truncate a window. The CSV is
+published only after every center and window finishes successfully; a failed
+export does not replace an existing CSV. Blank comments are retained, and
+repeated review updates keep the latest event version.
+
+Dates filter event activity, which can differ from the original review date.
+Only reviews retained in Zenoti's event feed and details returned by the API
+are available; this does not guarantee all historical reviews on Google or
+other review sites. The former `--filter` and `--expand-metadata` timeline
+options are removed. This CSV also differs from the invoice-based file expected
+by `feedback_report.py`.
+
+### API Responses and Troubleshooting
+
+| Response | Exporter behavior |
+| --- | --- |
+| HTTP 204 from `GET /feedbacks` | Successful **No Content** response. The appointment group has no returned feedback details. Log and cache an empty lookup, create no review row for it, and continue exporting other reviews. |
+| HTTP 429 | Back off and retry, honoring `Retry-After` when supplied. |
+| Empty or non-JSON HTTP 200 | Retry the same GET request; fail the export if retries are exhausted. |
+| Temporary GET failures, including HTTP 408 and 500/502/503/504 | Back off and retry. |
+
+An empty native feedback lookup can appear as:
+
+```text
+HTTP 204 on /feedbacks: no feedback details (appointment_group_id=...)
+```
+
+This message needs no retry. HTTP 204 handling is specific to native
+`/feedbacks` detail requests; it does not turn an unavailable event-feed page
+into a successful empty page.
+
+Retry settings come from `Zenoti/.env` or the process environment:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ZENOTI_MAX_RETRIES` | `5` | Up to five retries after the initial request. |
+| `ZENOTI_RETRY_BACKOFF` | `5` | Initial retry wait in seconds; doubles on subsequent retries. |
+| `ZENOTI_REQUEST_DELAY` | `0.4` | Pause between successive API requests. |
+
+Exhausted errors identify the center, date window, and endpoint. Event-feed
+errors include the requested page and received event count; native feedback
+errors include the event and appointment group. Non-JSON failures show the
+HTTP status, content type, and response body on a separate line.
+
+Restart an existing Python run after updating the code so it loads the current
+request handling.
+
+### Offline Checks
+
+These commands exercise export, request handling, and ingestion without live
+API requests or database writes:
+
+```powershell
+python Zenoti\zconnect\sync_hc.py --selftest
+python Zenoti\zconnect\get_events.py --self-check
+python -m unittest discover -s Zenoti\zconnect\tests -v
+```
+
+### Manual Review Loader
+
+The separate testing loader lives at
+`Zenoti/zconnect/hc_ingestion_manual/ingest_hc_events.py`. It reads
+`Zenoti/.env` and defaults to the newest `reviews_*.csv` in
+`Zenoti/zconnect/output/`. `--csv` selects a specific export. `--dry-run`
+validates without a database connection; `--check-db` also checks the live
+destination without writing. A successful manual load retains the CSV.
+
+```powershell
+python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --dry-run
+python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --check-db
+python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --csv path\to\reviews.csv
+python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --self-check
+```
+
+### Manual Feedback Metrics
+
+Previously downloaded feedback metrics CSVs can be loaded separately using
+`TABLE_HC_FEEDBACK`. This loader replaces rows by `center_id` and `date`:
+
+```powershell
+python Zenoti\zconnect\hc_ingestion_manual\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv" --dry-run
+python Zenoti\zconnect\hc_ingestion_manual\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv"
+```
 
 ## Call Log ID Capacity
 

@@ -82,7 +82,7 @@
     <th>Live calls made to</th>
   </tr>
   <tr>
-    <td><code>events.py</code></td>
+    <td><code>get_events.py</code></td>
     <td>required</td><td>not used</td>
     <td><code>api.zenoti.com</code> only</td>
   </tr>
@@ -129,17 +129,17 @@
 
 <h2>Quick start</h2>
 <pre><code>Activate: .venv\Scripts\Activate.ps1
-Run:      python zconnect\events.py</code></pre>
-<p>Run any script with no arguments and it fetches <em>every</em> center, for the date range in <code>.env</code> (or the last 7 days if unset), and writes a CSV named after the range.</p>
+Run:      python zconnect\get_events.py</code></pre>
+<p>The review exporter defaults to every accessible center from <code>2000-01-01</code> through today. <code>sync_hc.py --only events</code> uses the previous seven complete days. Other report scripts use their configured date ranges.</p>
 
 <h2>Scripts</h2>
 <table>
   <tr><th>Script</th><th>Endpoint</th><th>Credential</th><th>Output</th></tr>
   <tr>
-    <td><a href="#events"><code>events.py</code></a></td>
-    <td><code>GET /v1/zconnect/centers/{id}/events</code></td>
+    <td><a href="#events"><code>get_events.py</code></a></td>
+    <td><code>GET /v1/zconnect/centers/{id}/events?filter=feedback</code></td>
     <td>apikey</td>
-    <td>One row per timeline event</td>
+    <td>One row per review, with ratings and comments</td>
   </tr>
   <tr>
     <td><a href="#usage"><code>usage_data.py</code></a></td>
@@ -180,7 +180,7 @@ Run:      python zconnect\events.py</code></pre>
 <table>
   <tr><th>Flag</th><th>Meaning</th></tr>
   <tr><td><code>--center-id</code></td><td>Narrow to one center. Accepts a UUID or a center code like <code>BEL</code>. <strong>Omit it and you get every center</strong> — that is the default, not an opt-in.</td></tr>
-  <tr><td><code>--start-date</code> / <code>--end-date</code></td><td><code>YYYY-MM-DD</code>. Fall back to <code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code>, then to the last 7 days.</td></tr>
+  <tr><td><code>--start-date</code> / <code>--end-date</code></td><td><code>YYYY-MM-DD</code>. Most reports fall back to <code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code>, then to the last 7 days. <code>get_events.py</code> uses review-specific defaults described below.</td></tr>
   <tr><td><code>--csv</code></td><td>Output path. Each script has its own sensible default.</td></tr>
 </table>
 
@@ -205,34 +205,32 @@ Run:      python zconnect\events.py</code></pre>
 
 <hr>
 
-<h2 id="events">events.py</h2>
-<pre><code>GET /v1/zconnect/centers/{center_id}/events</code></pre>
-<p>Appointments, feedback, bot interactions and other centre activity, newest first.</p>
+<h2 id="events">get_events.py</h2>
+<pre><code>GET /v1/zconnect/centers/{center_id}/events?filter=feedback
+GET /v1/feedbacks?appointment_group_id=...</code></pre>
+<p>Export individual Google reviews and native Zenoti feedback with ratings, comments, replies, and full metadata. Review requests and unrelated timeline activity are skipped.</p>
 
-<h4>Fields (18)</h4>
-<p><code>guest_id, guest_name, mobilephone, event_id, action_type, source, send_date, reference_id_1, reference_id_2, old_value, new_value, metadata, profile_image, centerid, center_name, category_type, unread, channel_medium</code></p>
-<p>All 18 columns are always written, even when a field is blank on every row — the field list is held explicitly rather than inferred from what the API happened to return.</p>
+<h4>Fields (17)</h4>
+<p><code>center_id, center_name, review_key, event_id, metadata_index, guest_id, guest_name, reviewer_name, rating, comments, review_date, source, review_reply, review_reply_status, review_reply_metadata, event_date, metadata_json</code></p>
+<p>Blank comments are retained. Native ratings use <code>service_rating</code>, with unanswered values (<code>-1</code>) left blank. Full native details, including tags and separate rating dimensions, remain in <code>metadata_json</code>. Repeated reviews keep the latest event version.</p>
 
 <h4>Flags</h4>
 <table>
-  <tr><td><code>--filter feedback</code></td><td>Narrow to the feedback feed (<code>category_type 5</code>). Unrecognised values are ignored by the API.</td></tr>
-  <tr><td><code>--expand-metadata</code></td><td>Spread the <code>metadata</code> JSON into <code>metadata_&lt;key&gt;</code> columns.</td></tr>
-  <tr><td><code>--size</code></td><td>Records per page (default 200).</td></tr>
-  <tr><td><code>--max-pages</code></td><td>Page cap per chunk (default 50). Prints a warning if it truncates.</td></tr>
+  <tr><td><code>--start-date</code> / <code>--end-date</code></td><td>Inclusive event-activity dates. Standalone defaults are <code>2000-01-01</code> through today, overridden by <code>ZENOTI_REVIEW_START_DATE</code> / <code>ZENOTI_REVIEW_END_DATE</code>.</td></tr>
+  <tr><td><code>--center-id</code></td><td>One center UUID or code; omit for all accessible centers.</td></tr>
+  <tr><td><code>--size</code></td><td>Events per page (default 200).</td></tr>
+  <tr><td><code>--max-pages</code></td><td>Page cap per 10-day window; default 0 is unlimited. Reaching the cap aborts instead of publishing a truncated CSV.</td></tr>
+  <tr><td><code>--csv</code></td><td>Destination path; default <code>zconnect/output/reviews_&lt;scope&gt;_&lt;start&gt;_&lt;end&gt;.csv</code>.</td></tr>
+  <tr><td><code>--dry-run</code></td><td>Show dates and scope without API calls or CSV writes.</td></tr>
+  <tr><td><code>--self-check</code></td><td>Run offline exporter checks.</td></tr>
 </table>
 
-<h4>The metadata field</h4>
-<p><code>metadata</code> is a JSON string holding an array of objects, and its shape depends on <code>category_type</code>. Four have been observed:</p>
-<ul>
-  <li>a bare marker — <code>{"ItemType": n}</code></li>
-  <li>a call record — <code>guest_name</code>, <code>guest_phone_number</code>, <code>conference_name</code>, <code>outbound_recording</code>, <code>is_international</code></li>
-  <li>a guest/CRM block — <code>InvoiceId</code>, <code>MobilePhone</code>, <code>GuestReferralCode</code>, center address fields, <code>Opt-OutKeyword</code></li>
-  <li>an appointment block — <code>AppGroupId</code>, <code>StartTime</code>, <code>TreatmentList</code>, <code>AppCost</code></li>
-</ul>
-<p>By default it is written through verbatim. With <code>--expand-metadata</code> each object becomes its own row with its keys spread as <code>metadata_&lt;key&gt;</code>, so an event carrying three objects produces three rows, distinguished by <code>metadata_index</code>. Expect a wide, sparse file — that is the honest shape of a polymorphic field.</p>
+<p>Every page is fetched before publishing the CSV. HTTP 204 from <code>GET /feedbacks</code> is logged as an empty appointment-group lookup and does not abort the export. HTTP 429 and unexpected empty or non-JSON HTTP 200 responses are retried.</p>
+<p>The sync selects this exporter as <code>--only events</code>, supplies the previous seven complete days, skips browser login for reviews-only runs, and loads <code>TABLE_HC_EVENTS</code> directly in <code>sync_hc.py</code>. The separate manual loader is <code>hc_ingestion_manual/ingest_hc_events.py</code>.</p>
 
-<pre><code>python zconnect\events.py --start-date 2026-09-01 --end-date 2026-09-30 --expand-metadata
-# -> zconnect_events_all_meta_2026-09-01_2026-09-30.csv</code></pre>
+<pre><code>python zconnect\get_events.py --start-date 2026-09-01 --end-date 2026-09-30
+# -> zconnect/output/reviews_all_2026-09-01_2026-09-30.csv
+python zconnect\sync_hc.py --only events</code></pre>
 
 <hr>
 
@@ -395,6 +393,8 @@ Run:      python zconnect\events.py</code></pre>
 <h4>Error conventions</h4>
 <table>
   <tr><th>What you see</th><th>What it means</th></tr>
+  <tr><td>HTTP <code>204</code> from <code>GET /feedbacks</code></td><td>No Content: log an empty native feedback lookup and continue without retries.</td></tr>
+  <tr><td>Empty or non-JSON HTTP <code>200</code></td><td>Retry the same GET request; exhausted failures report the response details.</td></tr>
   <tr><td><code>CT028</code> with HTTP 200</td><td><strong>Empty result, not a failure.</strong> A range with no activity answers this instead of an empty list. Handled silently.</td></tr>
   <tr><td><code>CT004</code> / <code>CT026</code> / <code>CT060</code> / <code>CT061</code></td><td>Real errors — invalid input, missing center, missing dates.</td></tr>
   <tr><td>HTTP <code>403</code></td><td>Usually throttling, not permission. The same request succeeds moments later, so it is retried.</td></tr>
@@ -408,7 +408,8 @@ Run:      python zconnect\events.py</code></pre>
   <tr><th>Variable</th><th>Used by</th><th>Notes</th></tr>
   <tr><td><code>ZENOTI_API_KEY</code></td><td><strong>every script</strong></td><td>Required, always — <code>_client.py</code> refuses to import without it, so even the HyperConnect-only scripts need it present. Sent as <code>apikey</code>.</td></tr>
   <tr><td><code>ZENOTI_BASE_URL</code></td><td>all ZConnect routes</td><td>Defaults to <code>https://api.zenoti.com</code>. A trailing <code>/v1</code> is stripped.</td></tr>
-  <tr><td><code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code></td><td>all scripts</td><td>Default date range when no flags are given.</td></tr>
+  <tr><td><code>ZENOTI_START_DATE</code> / <code>ZENOTI_END_DATE</code></td><td>other report scripts</td><td>Default date range when no flags are given. The sync supplies its own dates.</td></tr>
+  <tr><td><code>ZENOTI_REVIEW_START_DATE</code> / <code>ZENOTI_REVIEW_END_DATE</code></td><td><code>get_events.py</code></td><td>Standalone review defaults; otherwise <code>2000-01-01</code> through today.</td></tr>
   <tr><td><code>ZENOTI_CENTER_ID</code></td><td>—</td><td><strong>Not used for scoping.</strong> Only <code>--center-id</code> narrows.</td></tr>
   <tr><td><code>ZENOTI_REQUEST_DELAY</code></td><td>ZConnect routes</td><td>Pause between calls. Default <code>0.4</code>.</td></tr>
   <tr><td><code>ZENOTI_MAX_RETRIES</code></td><td>both hosts</td><td>Default <code>5</code>.</td></tr>
@@ -424,7 +425,7 @@ Run:      python zconnect\events.py</code></pre>
 <p>Default names are distinct per script and per mode, so one run cannot silently overwrite another's output.</p>
 <table>
   <tr><th>Pattern</th><th>Written by</th></tr>
-  <tr><td><code>zconnect_events[_all][_&lt;filter&gt;][_meta]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>events.py</code></td></tr>
+  <tr><td><code>output/reviews_&lt;scope&gt;_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>get_events.py</code></td></tr>
   <tr><td><code>zconnect_usage[_all]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>usage_data.py</code></td></tr>
   <tr><td><code>zconnect_feedbacks[_all]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>feedback_metrics.py</code></td></tr>
   <tr><td><code>hc_call_logs[_&lt;by&gt;]_&lt;start&gt;_&lt;end&gt;.csv</code></td><td><code>call_logs.py</code></td></tr>
@@ -438,7 +439,7 @@ Run:      python zconnect\events.py</code></pre>
 <h2>Files in this folder</h2>
 <ul class="files">
   <li><code>_client.py</code> <span>— shared session, retries, date chunking, CSV writer</span></li>
-  <li><code>events.py</code> <span>— centre timeline events, with optional metadata expansion</span></li>
+  <li><code>get_events.py</code> <span>— individual Google reviews and native Zenoti feedback</span></li>
   <li><code>usage_data.py</code> <span>— messaging usage per centre per day</span></li>
   <li><code>feedback_metrics.py</code> <span>— review counts per centre per day</span></li>
   <li><code>call_logs.py</code> <span>— HyperConnect call logs and rollups</span></li>
