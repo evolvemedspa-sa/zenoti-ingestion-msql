@@ -1,449 +1,198 @@
-# Zenoti Stock Inventory Ingestion
+# Zenoti Ingestion and Form Exports
 
-## How Dates Work
+This project loads report exports and Zenoti / HyperConnect API data into SQL Server or Azure SQL, and exports service forms and guest form answers to CSV. The workflow list below follows the current runners and their required helpers.
 
-Stock inventory snapshots use **three separate date columns** that serve different purposes. Understanding the difference is critical for querying historical data correctly.
+Open [Documentation.html](Documentation.html) for the standalone guide with workflow navigation, active-script search, copyable commands and print / PDF support.
 
-### The Three Date Columns
+## Current workflows
 
-| Column | Type | Source | Purpose | Example |
-|--------|------|--------|---------|---------|
-| `date_inventory` | `date` | Filename | The business date of the snapshot — when the inventory count was taken | `2026-07-31` |
-| `date_inserted` | `datetime` | Script runtime | When this batch of rows was loaded into the database | `2026-08-01 09:15:23.456` |
-| `ingestion_timestamp` | `datetime` | Script runtime | Duplicate of `date_inserted` for compatibility | `2026-08-01 09:15:23.456` |
-
-### `date_inventory`: The Snapshot Date
-
-**This is the date that matters for business reporting.**
-
-The Zenoti export filename carries the snapshot date, and the script extracts it:
-
-```
-Current Stock_2026-07-31.csv  →  date_inventory = 2026-07-31
-current_stock_2026_07_29.csv  →  date_inventory = 2026-07-29
-Stock20260728.csv             →  date_inventory = 2026-07-28
-```
-
-Accepted filename patterns (first match wins):
-- `YYYY-MM-DD` or `YYYY_MM_DD` → e.g. `2026-07-31`
-- `YYYYMMDD` → e.g. `20260731`
-
-A file named `Current Stock.csv` with no date in the name loads successfully, but every row gets `date_inventory = NULL`. This makes the snapshot invisible to any date-filtered queries, so **always include the date in the filename**.
-
-### `date_inserted` and `ingestion_timestamp`: Load Timestamps
-
-Both columns hold the exact moment the script inserted each row, stamped in **New York local time** (America/New_York timezone, which is EST/EDT depending on the season).
-
-These timestamps answer "when did we load this?" and are useful for:
-- Detecting double-loads (same `date_inventory`, different `date_inserted`)
-- Auditing ingestion delays (difference between `date_inventory` and `date_inserted`)
-- Debugging loads that partially failed
-
-**All rows in one run get the same `date_inserted` value**, even when the script processes multiple files in one execution.
-
-### Why Two Load Timestamps?
-
-`ingestion_timestamp` was added for compatibility with other tables in the pipeline that use that column name. Both hold identical values. Queries can use either one.
-
-## Querying By Date
-
-### Get the most recent snapshot
-
-```sql
-SELECT TOP 1000 *
-FROM stock_inventory
-WHERE date_inventory = (SELECT MAX(date_inventory) FROM stock_inventory)
-```
-
-### Compare two specific snapshots
-
-```sql
--- July 30 vs July 31
-SELECT 
-    s1.product_code,
-    s1.product_name,
-    s1.on_hand_quantity AS qty_july30,
-    s2.on_hand_quantity AS qty_july31,
-    s2.on_hand_quantity - s1.on_hand_quantity AS change
-FROM 
-    stock_inventory s1
-INNER JOIN 
-    stock_inventory s2 
-    ON s1.product_code = s2.product_code
-WHERE 
-    s1.date_inventory = '2026-07-30'
-    AND s2.date_inventory = '2026-07-31'
-ORDER BY 
-    ABS(s2.on_hand_quantity - s1.on_hand_quantity) DESC
-```
-
-### Detect double-loads
-
-```sql
-SELECT 
-    date_inventory,
-    COUNT(*) AS row_count,
-    MIN(date_inserted) AS first_load,
-    MAX(date_inserted) AS last_load
-FROM stock_inventory
-GROUP BY date_inventory
-HAVING COUNT(DISTINCT date_inserted) > 1
-ORDER BY date_inventory DESC
-```
-
-If `first_load` and `last_load` differ for the same `date_inventory`, the snapshot was loaded more than once. This usually happens after a failure and manual re-run without cleaning up the partial load first.
-
-### Find snapshots loaded late
-
-```sql
-SELECT 
-    date_inventory,
-    MIN(date_inserted) AS loaded_at,
-    DATEDIFF(day, date_inventory, MIN(date_inserted)) AS days_delayed
-FROM stock_inventory
-GROUP BY date_inventory
-HAVING DATEDIFF(day, date_inventory, MIN(date_inserted)) > 1
-ORDER BY days_delayed DESC
-```
-
-## Loading Behavior
-
-### Append-Only
-
-Every `stock_inventory.py` run **appends** a full snapshot to the table. Nothing is deleted or updated, so the table accumulates history:
-
-```
-date_inventory  | rows   | loaded_at
-----------------|--------|------------------
-2026-07-29      | 3,512  | 2026-07-30 08:10
-2026-07-30      | 3,515  | 2026-07-31 08:05
-2026-07-31      | 3,515  | 2026-08-01 09:15
-```
-
-This means:
-- ✅ Historical comparisons work out of the box
-- ✅ A failed load can be cleaned up by deleting rows with a specific `date_inventory` and re-running
-- ⚠️ The table grows by ~3,500 rows per day
-- ⚠️ Queries must filter on `date_inventory` to avoid scanning the entire history
-
-### Processing Multiple Files
-
-When the `.env` variable `CSV_FILE_STOCK_INVENTORY` points to a **directory** instead of a single file, the script processes all `.csv`, `.xlsx`, and `.xlsm` files in that directory in alphabetical order.
-
-Each file's `date_inventory` is extracted from its own filename. This is how you can backfill multiple days in one run:
-
-```
-/stock_exports/
-  current_stock_2026-07-28.csv  → date_inventory = 2026-07-28
-  current_stock_2026-07-29.csv  → date_inventory = 2026-07-29
-  current_stock_2026-07-30.csv  → date_inventory = 2026-07-30
-```
-
-Running `stock_inventory.py` once on that directory loads all three snapshots, each with its correct `date_inventory`, but all three share the same `date_inserted` timestamp.
-
-### Google Drive Integration
-
-When `.env` has:
-
-```env
-CSV_SOURCE=gdrive
-GDRIVE_FOLDER_STOCK_INVENTORY=<folder_id>
-GDRIVE_CREDENTIALS_JSON=<service_account_json>
-```
-
-The script downloads **all CSV files** from that Google Drive folder to a temp directory and processes them just like the local-directory case above. Each file must still have the date in its filename.
-
-## Troubleshooting
-
-### All `date_inventory` values are NULL
-
-**Cause:** The filename does not contain a recognizable date pattern.
-
-**Fix:** Rename the file to include the date, e.g. `Current Stock_2026-07-31.csv`, and reload.
-
-### Duplicate rows for the same `date_inventory`
-
-**Cause:** The script ran more than once on the same snapshot without deleting the previous load.
-
-**Fix:** Delete the duplicates and reload:
-
-```sql
--- Find the extra load
-SELECT date_inventory, date_inserted, COUNT(*)
-FROM stock_inventory
-GROUP BY date_inventory, date_inserted
-HAVING COUNT(*) > 0
-ORDER BY date_inventory DESC
-
--- Delete one of the duplicate loads (pick the timestamp to remove)
-DELETE FROM stock_inventory
-WHERE date_inventory = '2026-07-31' AND date_inserted = '2026-08-01 12:00:00.000'
-```
-
-### `date_inventory` is one day behind the export date
-
-This is expected. Zenoti generates the "Current Stock" export at the end of the business day, so a report exported on August 1 reflects inventory **as of July 31**. The filename should match the snapshot date (July 31), not the export date (August 1).
-
-### `date_inserted` is in the wrong timezone
-
-`date_inserted` is always stamped in **New York time** (America/New_York), regardless of where the script runs. This is intentional — it keeps all timestamps consistent even when the script moves to a server in a different timezone.
-
-If you need UTC or another timezone for reporting, convert it in the query:
-
-```sql
-SELECT 
-    date_inventory,
-    date_inserted,
-    date_inserted AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC' AS date_inserted_utc
-FROM stock_inventory
-```
-
-## HyperConnect Sync
-
-`Zenoti/zconnect/sync_hc.py` runs `agent_metrics`, `location_performance`,
-`events`, and `call_logs`. Review ingestion runs directly inside
-`sync_hc.py` and loads `TABLE_HC_EVENTS`. The other reports use
-`hc_sql_helper/import_hc_report.py`. `feedback_metrics` is currently disabled
-in the sync.
-The `events` report runs `get_events.py`; use `--only events` to select it.
-
-Run these commands from the repository root:
-
-```powershell
-# Pull and load all enabled reports.
-python Zenoti\zconnect\sync_hc.py
-
-# Pull and load reviews only; uses ZENOTI_API_KEY and skips browser login.
-python Zenoti\zconnect\sync_hc.py --only events
-
-# Widen the review backfill to the previous 14 complete days.
-python Zenoti\zconnect\sync_hc.py --only events --lookback 14
-
-# Backfill an explicit date range.
-python Zenoti\zconnect\sync_hc.py --only events --start-date 2026-11-01 --end-date 2026-11-16
-
-# Export reviews to CSV without loading SQL.
-python Zenoti\zconnect\sync_hc.py --only events --no-ingest
-```
-
-With no explicit dates, the sync fetches the previous **seven complete days**,
-ending yesterday (`--lookback 7 --t-minus 1`). For example, a run on
-**November 17, 2026 fetches November 10 through November 16, inclusive**.
-The date is taken from the machine running the script; the deployed container
-uses UTC. This overlapping window catches late-arriving data and updates to
-reviews loaded on previous runs. `--start-date`, `--end-date`, and
-`--center-id` are forwarded to the exporter.
-
-HyperConnect reports require a browser bearer token, captured once per run
-or supplied with `--token`. Reviews use `ZENOTI_API_KEY` from
-`Zenoti/.env`. A run with `--only events` needs no browser login.
-
-### Review SQL Ingestion
-
-The production review loader is built into `sync_hc.py`. Configure
-`TABLE_HC_EVENTS` and the shared SQL connection settings in `Zenoti/.env`.
-The destination must already have the **17 columns exported by `get_events.py`**
-plus `date_inserted datetime2(7)`, with a primary key or unique index on
-`review_key`. The loader validates the CSV, destination schema, and value
-capacity before writing. The former timeline CSV uses a different schema.
-
-Reviews are inserted or refreshed by `review_key` in one transaction. A
-failure rolls back the load. Reviews outside the CSV are retained, and older
-event versions cannot overwrite newer stored versions. Unicode text,
-whitespace, multiline and blank comments, and JSON are preserved.
-
-For a log such as:
-
-```text
-Ingested: 2 inserted, 3 refreshed, 1 older versions skipped.
-```
-
-| Count | Meaning |
-| --- | --- |
-| `inserted` | New `review_key` values were added, with a UTC `date_inserted`. |
-| `refreshed` | Existing rows were updated using an equal or newer event timestamp. Identical reviews fetched again can count as refreshed. |
-| `older versions skipped` | Incoming events were older than the stored review and were left out of the update. |
-
-Refreshes preserve the original `date_inserted`. The seven-day overlap
-therefore commonly refreshes previous records without creating duplicate
-reviews, while also capturing changed ratings, comments, or replies.
-
-During sync ingestion, CSVs are temporary hand-offs and are deleted after a
-successful load. A failed review load keeps `Zenoti/zconnect/events.csv`
-for inspection. `--no-ingest` leaves review exports in
-`Zenoti/zconnect/output/`. `--stop-on-error` stops the sync at the first
-failed pull or load.
-
-## Individual Review Export
-
-`Zenoti/zconnect/get_events.py` exports individual ratings, comments, reviewer
-names, review dates, sources, replies, and full review metadata to a local CSV.
-It uses `ZENOTI_API_KEY` and optional `ZENOTI_BASE_URL` from
-`Zenoti/.env`.
-
-The exporter reads
-`GET /v1/zconnect/centers/{center_id}/events?filter=feedback`. Google reviews
-come from event metadata. Submitted Zenoti feedback is followed through
-`GET /v1/feedbacks?appointment_group_id=...` and exported with
-`source=ZENOTI`. Native tags, invoice information, and separate rating
-dimensions are preserved in `metadata_json`. The native `rating` is
-`service_rating`; unanswered values (`-1`) are left blank.
-
-```powershell
-python Zenoti\zconnect\get_events.py --start-date 2026-01-01
-python Zenoti\zconnect\get_events.py --center-id cac21ac7-7925-418f-ae6e-1f3e8d45ca2b --start-date 2026-11-01 --end-date 2026-11-16
-python Zenoti\zconnect\get_events.py --start-date 2026-11-01 --end-date 2026-11-16 --csv reviews.csv
-python Zenoti\zconnect\get_events.py --dry-run
-```
-
-Running `get_events.py` directly defaults to all accessible centers from
-`2000-01-01` through today. The seven-day default belongs to `sync_hc.py`.
-`ZENOTI_REVIEW_START_DATE` and `ZENOTI_REVIEW_END_DATE` can override the
-standalone export defaults; general pipeline date settings are not used.
-
-Default output is
-`Zenoti/zconnect/output/reviews_<scope>_<start>_<end>.csv`; `--csv` selects
-another path. Every page is fetched in inclusive 10-day windows. An optional
-`--max-pages` cap aborts the export if it would truncate a window. The CSV is
-published only after every center and window finishes successfully; a failed
-export does not replace an existing CSV. Blank comments are retained, and
-repeated review updates keep the latest event version.
-
-Dates filter event activity, which can differ from the original review date.
-Only reviews retained in Zenoti's event feed and details returned by the API
-are available; this does not guarantee all historical reviews on Google or
-other review sites. The former `--filter` and `--expand-metadata` timeline
-options are removed. This CSV also differs from the invoice-based file expected
-by `feedback_report.py`.
-
-### API Responses and Troubleshooting
-
-| Response | Exporter behavior |
-| --- | --- |
-| HTTP 204 from `GET /feedbacks` | Successful **No Content** response. The appointment group has no returned feedback details. Log and cache an empty lookup, create no review row for it, and continue exporting other reviews. |
-| HTTP 429 | Back off and retry, honoring `Retry-After` when supplied. |
-| Empty or non-JSON HTTP 200 | Retry the same GET request; fail the export if retries are exhausted. |
-| Temporary GET failures, including HTTP 408 and 500/502/503/504 | Back off and retry. |
-
-An empty native feedback lookup can appear as:
-
-```text
-HTTP 204 on /feedbacks: no feedback details (appointment_group_id=...)
-```
-
-This message needs no retry. HTTP 204 handling is specific to native
-`/feedbacks` detail requests; it does not turn an unavailable event-feed page
-into a successful empty page.
-
-Retry settings come from `Zenoti/.env` or the process environment:
-
-| Setting | Default | Purpose |
+| Workflow | Entry point | Result |
 | --- | --- | --- |
-| `ZENOTI_MAX_RETRIES` | `5` | Up to five retries after the initial request. |
-| `ZENOTI_RETRY_BACKOFF` | `5` | Initial retry wait in seconds; doubles on subsequent retries. |
-| `ZENOTI_REQUEST_DELAY` | `0.4` | Pause between successive API requests. |
+| Main ingestion | [`Zenoti/run_all.py`](Zenoti/run_all.py) | 15 ordered report and SQL steps |
+| HyperConnect | [`Zenoti/zconnect/sync_hc.py`](Zenoti/zconnect/sync_hc.py) | Three enabled communication reports and SQL loads |
+| PO / Transfer | [`Zenoti/PO_Transfer/run_all.py`](Zenoti/PO_Transfer/run_all.py) | Order summary plus purchase and transfer product details |
+| Service forms | [`Zenoti/guest_form_retrieve/service_forms.py`](Zenoti/guest_form_retrieve/service_forms.py) | Forms Review CSV |
+| Guest form answers | [`Zenoti/guest_form_retrieve/retrieve_guest_forms.py`](Zenoti/guest_form_retrieve/retrieve_guest_forms.py) | Guest answers selected through appointment dates |
 
-Exhausted errors identify the center, date window, and endpoint. Event-feed
-errors include the requested page and received event count; native feedback
-errors include the event and appointment group. Non-JSON failures show the
-HTTP status, content type, and response body on a separate line.
+## Local setup
 
-Restart an existing Python run after updating the code so it loads the current
-request handling.
-
-### Offline Checks
-
-These commands exercise export, request handling, and ingestion without live
-API requests or database writes:
+Use Python 3.11 or newer. Commands below run from the repository root in PowerShell. Install Microsoft ODBC Driver 18 for SQL workflows and Google Chrome for local browser login.
 
 ```powershell
-python Zenoti\zconnect\sync_hc.py --selftest
-python Zenoti\zconnect\get_events.py --self-check
-python -m unittest discover -s Zenoti\zconnect\tests -v
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install -r Zenoti\requirements.txt
 ```
 
-### Manual Review Loader
-
-The separate testing loader lives at
-`Zenoti/zconnect/hc_ingestion_manual/ingest_hc_events.py`. It reads
-`Zenoti/.env` and defaults to the newest `reviews_*.csv` in
-`Zenoti/zconnect/output/`. `--csv` selects a specific export. `--dry-run`
-validates without a database connection; `--check-db` also checks the live
-destination without writing. A successful manual load retains the CSV.
+Install the extra requirements for the workflows you run:
 
 ```powershell
-python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --dry-run
-python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --check-db
-python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --csv path\to\reviews.csv
-python Zenoti\zconnect\hc_ingestion_manual\ingest_hc_events.py --self-check
+& .\.venv\Scripts\python.exe -m pip install -r Zenoti\zconnect\requirements.txt
+& .\.venv\Scripts\python.exe -m pip install -r Zenoti\PO_Transfer\requirements.txt
+& .\.venv\Scripts\python.exe -m pip install -r Zenoti\guest_form_retrieve\requirements.txt
 ```
 
-### Manual Feedback Metrics
+Configure `Zenoti/.env`; process environment variables take precedence. The PO service reads `Zenoti/PO_Transfer/.env` when present, otherwise the shared file. On Railway, supply settings through Variables.
 
-Previously downloaded feedback metrics CSVs can be loaded separately using
-`TABLE_HC_FEEDBACK`. This loader replaces rows by `center_id` and `date`:
+- SQL: `SERVER`, `DATABASE`, `DB_USER`, `DB_PASSWORD` and the configured destination tables.
+- Main CSV sources: `CSV_SOURCE=local` with report-specific `CSV_FILE_*`, or `CSV_SOURCE=gdrive` with `GDRIVE_FOLDER_*` and Drive credentials. Cost of goods uses the `COG` suffix.
+- API workflows: `ZENOTI_API_KEY`. Both form scripts also load the shared API-key client.
+- Browser login: `MINER_USER` and `MINER_PASSWORD`; Playwright must be installed in the interpreter that runs the command.
+- Log upload: `GDRIVE_PARENT_FOLDER` and configured Drive credentials.
+
+## Main SQL ingestion
 
 ```powershell
-python Zenoti\zconnect\hc_ingestion_manual\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv" --dry-run
-python Zenoti\zconnect\hc_ingestion_manual\ingest_feedback_metrics.py "Zenoti\sample csv\zconnect_feedbacks_all_2025-01-01_2026-10-26.csv"
+& .\.venv\Scripts\python.exe Zenoti\run_all.py
 ```
 
-## Call Log ID Capacity
+`run_all.py` sets each child working directory to `Zenoti/`, runs the following list in order, and stops when a child exits with a nonzero status:
 
-HyperConnect can return composite call IDs containing a call SID and a GUID,
-which are 71 characters long. A `CALL_ID` column sized at 50 or 64 characters
-rejects those rows before the loader writes anything. Keep the full ID: it is
-the key used to replace each call on a later import.
+| Order | Script | Purpose |
+| --- | --- | --- |
+| 1 | [`Zenoti/sql_helper.py`](Zenoti/sql_helper.py) | Clear recognized CSV date ranges for configured report tables before imports. |
+| 2 | [`Zenoti/appointments.py`](Zenoti/appointments.py) | Load appointment report exports into SQL. |
+| 3 | [`Zenoti/block_out_update.py`](Zenoti/block_out_update.py) | Synchronize attendance and block-out records using schedule identifiers. |
+| 4 | [`Zenoti/cost_of_goods.py`](Zenoti/cost_of_goods.py) | Load cost-of-goods report transactions. |
+| 5 | [`Zenoti/cash.py`](Zenoti/cash.py) | Load cash and payment exports used by downstream reporting. |
+| 6 | [`Zenoti/memberships.py`](Zenoti/memberships.py) | Load membership sale exports. |
+| 7 | [`Zenoti/employee_sales.py`](Zenoti/employee_sales.py) | Load employee sales exports with SQL type-aware binding. |
+| 8 | [`Zenoti/feedback_report.py`](Zenoti/feedback_report.py) | Validate detailed feedback CSVs and replace fetched center/invoice pairs. |
+| 9 | [`Zenoti/stock_ledger.py`](Zenoti/stock_ledger.py) | Load stock movement and ledger transactions. |
+| 10 | [`Zenoti/business_kpi_v3.py`](Zenoti/business_kpi_v3.py) | Refresh KPI snapshots by their filename-derived business date. |
+| 11 | [`Zenoti/fb_ads.py`](Zenoti/fb_ads.py) | Load Facebook advertising metrics using report business keys. |
+| 12 | [`Zenoti/google_ads.py`](Zenoti/google_ads.py) | Load Google advertising metrics using report business keys. |
+| 13 | [`Zenoti/update_zenoti_cohort.py`](Zenoti/update_zenoti_cohort.py) | Refresh the customer-spend source legs after the cash load. |
+| 14 | [`Zenoti/stock_inventory.py`](Zenoti/stock_inventory.py) | Append stock snapshots and derive the inventory date from each filename. |
+| 15 | [`Zenoti/get_guest_birthday_v3.py`](Zenoti/get_guest_birthday_v3.py) | Fetch guests selected by creation date, confirm missing birthdays, and refresh fetched SQL guest keys. |
 
-The schema helper widens an existing `varchar` or `nvarchar` `CALL_ID` to 128
-characters while preserving its type, nullability and indexes. It leaves
-columns already at least 128 characters, including `MAX`, alone. Preview and
-apply the fix from the repository root:
+`sql_helper.py` commits cleanup of recognized CSV windows before the report imports. Subsequent steps commit independently, so the runner is not one transaction. Earlier changes remain applied after a later failure. Some loaders skip missing input; review their output even when the runner completes.
+
+The main log is `Zenoti/logs/sql_ingestion_logs_<timestamp>.txt`, with a best-effort Drive upload when configured. Detailed feedback replaces fetched `Center Name + Invoice No` pairs. Business KPI snapshots replace their parsed business date.
+
+## HyperConnect
 
 ```powershell
-python Zenoti\zconnect\hc_sql_helper\fix_hc_tables.py --report call_logs
-python Zenoti\zconnect\hc_sql_helper\fix_hc_tables.py --report call_logs --apply
+& .\.venv\Scripts\python.exe Zenoti\zconnect\sync_hc.py
+& .\.venv\Scripts\python.exe Zenoti\zconnect\sync_hc.py --lookback 1
+& .\.venv\Scripts\python.exe Zenoti\zconnect\sync_hc.py --no-ingest
 ```
 
-Then load the retained CSV on the machine where the failed sync ran, passing
-its actual path:
+The enabled reports are:
+
+| Report | Grain | SQL business key |
+| --- | --- | --- |
+| [`Zenoti/zconnect/agent_metrics.py`](Zenoti/zconnect/agent_metrics.py) | Agent / center / day | `agent_id + center_id + start_date + end_date + date` |
+| [`Zenoti/zconnect/location_performance.py`](Zenoti/zconnect/location_performance.py) | Center / day | `center_id + start_date + end_date` |
+| [`Zenoti/zconnect/call_logs.py`](Zenoti/zconnect/call_logs.py) | Individual call | `call_id` |
+
+The runner captures one bearer token and passes `HC_TOKEN` to its children in memory. The default range is seven completed days ending yesterday; `--lookback 1` selects yesterday. Explicit `--start-date` / `--end-date` flags override the rolling range. The default Railway runner clock is UTC.
+
+SQL loads delete and insert only the incoming business keys in one transaction. Keys absent from the pull remain. Successful loads remove their temporary CSV; failed loads keep the CSV in `Zenoti/zconnect/`. `--no-ingest` keeps all report CSVs. Use `--only`, `--skip`, `--stop-on-error` or `--hc-extras` for the enabled reports.
+
+## Purchase and transfer orders
 
 ```powershell
-python Zenoti\zconnect\hc_sql_helper\import_hc_report.py --report call_logs --csv path\to\call_logs.csv
+& .\.venv\Scripts\python.exe Zenoti\PO_Transfer\run_all.py --dry-run
+& .\.venv\Scripts\python.exe Zenoti\PO_Transfer\run_all.py
 ```
 
-## Verification
+The runner fetches one shared API snapshot and loads three outputs:
 
-After running `stock_inventory.py`, check the load with:
+| Output | Used script | Behavior |
+| --- | --- | --- |
+| Order summary | [`Zenoti/PO_Transfer/po_and_transfers_api.py`](Zenoti/PO_Transfer/po_and_transfers_api.py) | Upsert by ref_no; preserve existing summary IDs |
+| Purchase product details | [`Zenoti/PO_Transfer/purchase_order.py`](Zenoti/PO_Transfer/purchase_order.py) | Replace products for fetched purchase orders |
+| Transfer product details | [`Zenoti/PO_Transfer/transfer_order.py`](Zenoti/PO_Transfer/transfer_order.py) | Replace products for fetched transfer orders |
 
-```bash
-python dbquery/inventory_table_check.py          # newest snapshot
-python dbquery/inventory_table_check.py 2026-07-31  # specific date
+The default window is 31 completed days ending yesterday in `America/New_York`. Ordered, raised, delivered and completed criteria are fetched. All API windows complete before the summary and both details are verified and committed in one SQL transaction. A SQL failure rolls them back together; orders outside the pull remain.
+
+Local snapshots, CSVs and checkpoints are kept under `Zenoti/PO_Transfer/data/api_order_ingestion/<start>_to_<end>/`. Railway removes temporary data after success or failure and uploads a concise service log. Use `--resume` for local backfills with retained checkpoints. `--dry-run` avoids API/SQL work but still creates the runner log and can upload it.
+
+See [PO / Transfer README](Zenoti/PO_Transfer/README.md) for its service configuration, destination bindings and schema behavior.
+
+## Form exports
+
+```powershell
+& .\.venv\Scripts\python.exe Zenoti\guest_form_retrieve\service_forms.py --start-date 2026-11-05 --end-date 2026-11-06
+& .\.venv\Scripts\python.exe Zenoti\guest_form_retrieve\retrieve_guest_forms.py --start-date 2026-11-05 --end-date 2026-11-06
 ```
 
-This script reports:
-- How many snapshots are in the table and when each was loaded
-- Whether key columns like `product_code`, `on_hand_quantity`, and `date_inventory` are populated
-- Sample rows to eyeball
+- `service_forms.py` exports the regional Forms Review report with 17 columns and one CSV row per API record. Default `--auth login` captures a fresh browser token; `--auth web` uses a supplied token and `--auth auto` tries a supplied token before logging in. It defaults to all centers and review/submission states.
+- `retrieve_guest_forms.py` fetches appointments once per center / date window without `page` or `size`, then fetches each unique guest's answers once. Signatures are excluded, identified duplicate appointments are removed, and missing-ID appointments are retained.
+- Both commands accept inclusive input dates. Guest appointment requests advance the final bound by one day and use windows of at most seven days. Guest dates select appointments, not form submission dates or a particular service-form instance.
+- Guest requests log each attempt immediately. `ZENOTI_CONNECT_TIMEOUT` and `ZENOTI_READ_TIMEOUT` must be positive and default to 10 / 30 seconds per attempt.
+- CSVs are written to the working directory. Default names are `zenoti_service_forms_<start>_<end>.csv` and `zenoti_guest_forms_<start>_<end>.csv`. Guest failures are recorded in an errors CSV, including runs with no recovered appointments. Service forms supports `--csv`.
+- These two commands export CSVs; neither loads SQL.
 
-A successful load shows:
+See [Form export README](Zenoti/guest_form_retrieve/README.md) for optional authentication, host, request-body and deployment controls.
 
+## Dates and stock inventory
+
+| Workflow | Date selection | Notes |
+| --- | --- | --- |
+| Main CSV reports | Source filenames and report columns. | Cleanup recognizes YYYY-MM-DD_to_YYYY-MM-DD for configured report prefixes. |
+| HyperConnect runner | Seven completed days ending yesterday. | --lookback 1 selects yesterday. The default Railway runner clock is UTC; call timestamps use UTC days. |
+| PO / Transfer runner | 31 completed days ending yesterday in America/New_York. | CLI boundaries override fixed service/shared dates, then the rolling range. |
+| Guest birthday step | Guests created in the previous two calendar days, ending yesterday. | Uses the process clock. --from / --to select creation dates, not birthday dates. |
+| Service forms | Seven days ago through today, unless CLI/shared dates are supplied. | Both bounds inclusive; report requests send 00:00:00 through 23:59:59. |
+| Guest form answers | Same inclusive input defaults as service forms. | Appointments use an exclusive end date, advanced one day. Windows contain at most seven days. |
+
+Stock inventory keeps snapshot dates separate from load timestamps:
+
+| Column | Meaning |
+| --- | --- |
+| `date_inventory` | Snapshot business date parsed from the filename. |
+| `date_inserted` | Stock load time in America/New_York. |
+| `ingestion_timestamp` | The same stock load time, where the target table has this column. |
+
+Snapshot filenames can contain `YYYY-MM-DD`, `YYYY_MM_DD` or `YYYYMMDD`, for example `Current Stock_2026-07-31.csv`. Missing filename dates produce null `date_inventory` values. CSV, XLSX and XLSM inputs are supported; spreadsheets also need a compatible pandas Excel engine. A configured directory can supply multiple files.
+
+`stock_inventory.py` appends a full snapshot on every run. Repeating a snapshot can create duplicates. All files in one run share the New York load timestamp; identify batches by snapshot date and insertion time.
+
+## Required helpers
+
+| Script | Purpose |
+| --- | --- |
+| [`Zenoti/zconnect/hc_sql_helper/import_hc_report.py`](Zenoti/zconnect/hc_sql_helper/import_hc_report.py) | Match CSV headers to live SQL column types and replace the business keys present in each incoming report. |
+| [`Zenoti/zconnect/hc_sql_helper/csv_table.py`](Zenoti/zconnect/hc_sql_helper/csv_table.py) | Provide CSV normalization, coercion, column mapping and validation for the report importer. |
+| [`Zenoti/zconnect/_client.py`](Zenoti/zconnect/_client.py) | Provide API-key and HyperConnect clients, retries, center resolution and CSV utilities. |
+| [`Zenoti/zconnect/login_headers.py`](Zenoti/zconnect/login_headers.py) | Capture an admin bearer token through Playwright; runners use the token in memory. |
+| [`Zenoti/PO_Transfer/order_listing_api.py`](Zenoti/PO_Transfer/order_listing_api.py) | Fetch and normalize the Orders Listing snapshot used by summary and detail loaders. |
+| [`Zenoti/PO_Transfer/api_client.py`](Zenoti/PO_Transfer/api_client.py) | Provide inventory API authentication, request pacing, date splitting and center configuration. |
+| [`Zenoti/PO_Transfer/detail_sql.py`](Zenoti/PO_Transfer/detail_sql.py) | Replace product rows for fetched orders inside the shared transaction. |
+| [`Zenoti/PO_Transfer/config.py`](Zenoti/PO_Transfer/config.py) | Load the service environment, falling back to Zenoti/.env for local runs. |
+| [`Zenoti/PO_Transfer/db_helper.py`](Zenoti/PO_Transfer/db_helper.py) | Provide SQL connection settings, driver selection and connection retries for the order service. |
+| [`Zenoti/PO_Transfer/service_log.py`](Zenoti/PO_Transfer/service_log.py) | Capture service output and upload its concise run log to Google Drive. |
+| [`Zenoti/PO_Transfer/gdrive_helper.py`](Zenoti/PO_Transfer/gdrive_helper.py) | Upload order-service logs using configured service-account or OAuth credentials. |
+| [`Zenoti/guest_form_retrieve/_shared.py`](Zenoti/guest_form_retrieve/_shared.py) | Load the shared environment and import existing ZConnect helpers by file path. |
+| [`Zenoti/db_helper.py`](Zenoti/db_helper.py) | Provide SQL connection strings, ODBC driver selection and transient connection retries. |
+| [`Zenoti/gdrive_helper.py`](Zenoti/gdrive_helper.py) | List and download report CSVs from Google Drive and upload service logs. |
+| [`Zenoti/service_log.py`](Zenoti/service_log.py) | Tee service output to a log file and upload it to the configured Drive folder. |
+
+## Railway deployment
+
+| Workflow | Root directory | Dockerfile path | Container command |
+| --- | --- | --- | --- |
+| `Main SQL ingestion` | `Zenoti` | `Dockerfile` | `python run_all.py` |
+| `HyperConnect` | `Zenoti` | `zconnect/Dockerfile` | `python zconnect/sync_hc.py` |
+| `PO / Transfer` | `Repository root (leave blank)` | `Zenoti/PO_Transfer/Dockerfile` | `python -u run_all.py` |
+| `Form exports` | `Zenoti` | `guest_form_retrieve/Dockerfile` | `python guest_form_retrieve/service_forms.py` |
+
+The SQL images install ODBC Driver 18. HyperConnect and form images install Chromium; local browser login uses Chrome. The form image defaults to the service report; use `python guest_form_retrieve/retrieve_guest_forms.py` as its start command for guest answers. Collect exported CSVs or use a persistent volume when they must survive an ephemeral container run. Railway cron schedules use UTC.
+
+## Verification and troubleshooting
+
+Form regression checks run with mocked API and browser calls:
+
+```powershell
+& .\.venv\Scripts\python.exe -m unittest discover -s Zenoti/guest_form_retrieve/tests -v
 ```
-Most recent 1 snapshot(s) by date_inventory:
-  2026-07-31      3,515 rows   loaded 2026-08-01 09:15:23.456
 
-Checking snapshot 2026-07-31: 3,515 rows
-  Source file(s):
-    current_stock_2026-07-31.csv: 3,515 rows
+- Missing Playwright: install requirements into the interpreter path shown by the error.
+- SQL connection errors: check Driver 18, connection settings and server reachability.
+- Repeated 401 / 403: check fresh bearer login, report permission and regional host; API-key workflows need a valid API key.
+- CSV locked by Excel: close it. Guest forms fall back to a timestamped path; service forms report the lock.
+- Unexpected SKIP or empty output: check the logged dates, input files, filename patterns and configured Drive folders.
+- Missing stock snapshot dates: use a recognized date in the filename.
 
-  Populated values per key column:
-    center_name                      3,515 / 3,515  (100.0%)
-    product_code                     3,515 / 3,515  (100.0%)
-    product_name                     3,515 / 3,515  (100.0%)
-    on_hand_quantity                 3,515 / 3,515  (100.0%)
-    date_inventory                   3,515 / 3,515  (100.0%)
-
-Looks good - 3,515 rows loaded with all key columns populated.
-```
-
-If `date_inventory` shows `<-- ALL NULL`, the filename pattern was not recognized. Rename and reload.
+Update this README and `Documentation.html` when an entry point or active run list changes.
