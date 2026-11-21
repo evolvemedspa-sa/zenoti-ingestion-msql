@@ -9,6 +9,7 @@ then the current folder) or from real environment variables, which take priority
     ZENOTI_API_KEY=your-key            (required)
     ZENOTI_API_BASE=https://api.zenoti.com/v1   (optional)
     ZENOTI_CENTER_ID=uuid1,uuid2       (optional; default = all centers)
+    GUEST_DOB_SQL_ENABLED=true        (optional; false = CSV export only)
 
 Endpoints (https://docs.zenoti.com):
     GET /v1/centers                                   list all centers
@@ -56,6 +57,10 @@ names or birthdays are logged). The CSV contains personal data; store it
 securely. After a successful fetch and CSV export, fetched guest keys are deleted
 and reinserted in TABLE_GUEST_DOB (dbo.BRONZE_ZENOTI_DOB by default) in one SQL
 transaction. Existing rows for guests outside the fetched window are preserved.
+SQL stages log their timings and report waiting every 10 seconds; insertion
+progress is logged every 100 rows, followed by the final commit.
+Set GUEST_DOB_SQL_ENABLED=false to skip SQL and retain the completed checkpoint;
+set it back to true and use --resume with the same output and filters to load SQL.
 Nothing is written back to Zenoti.
 """
 import argparse
@@ -66,11 +71,13 @@ import os
 import sqlite3
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from contextlib import contextmanager
 from email.message import Message
 from pathlib import Path
 from uuid import UUID
@@ -82,6 +89,7 @@ MAX_PAGES = 5000
 RETRY_STATUS = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 5
 PROGRESS_EVERY = 25      # log a progress line every N detail lookups
+SQL_PROGRESS_INTERVAL = 10  # keep slow SQL stages visible while the driver waits
 DEFAULT_LAG_DAYS = 2     # two complete days ending yesterday; today is excluded
 MAX_CHUNK_DAYS = 30      # longest single request window (Zenoti rejects about a month+)
 
@@ -326,7 +334,8 @@ def list_guests(get, center_id, last_updated=None, start_page=1, on_page_complet
     raise ValueError(f"More than {MAX_PAGES} pages for center {center_id}; use a shorter --from/--to range.")
 
 
-def collect_rows(get, center_ids, names, chunks=None, on_row=None, details=None, checkpoint=None):
+def collect_rows(get, center_ids, names, chunks=None, on_row=None, details=None, checkpoint=None,
+                 strict_created=False):
     """Return (rows, detail_lookups).
 
     chunks is a list of inclusive (start, end) creation-date windows, each short
@@ -336,6 +345,7 @@ def collect_rows(get, center_ids, names, chunks=None, on_row=None, details=None,
     list or, when missing, from the guest details. A guest whose created_date can't
     be read is kept (and counted in a warning) rather than silently dropped.
     Each guest is written once and its details are fetched at most once.
+    strict_created refuses guests whose creation date cannot be verified.
     """
     rows = checkpoint.load_rows() if checkpoint else []
     fallbacks = 0
@@ -408,6 +418,8 @@ def collect_rows(get, center_ids, names, chunks=None, on_row=None, details=None,
                     if window and created is None:
                         created = parse_created(detail.get("created_date"))
                         if created is None:
+                            if strict_created:
+                                raise ValueError(f"Cannot verify creation date for guest {guest_id}; backfill stopped.")
                             unknown_created.add(guest_id)
                         elif not in_window(created, start, end):
                             continue
@@ -615,8 +627,46 @@ def write_csv_atomically(rows, output):
     os.rename(partial, output)
 
 
+def sql_ingestion_enabled():
+    """Birthday SQL ingestion defaults to on; reject ambiguous configuration."""
+    value = os.getenv("GUEST_DOB_SQL_ENABLED", "true").strip().lower()
+    if value in {"true", "1", "yes", "on"}:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError("GUEST_DOB_SQL_ENABLED must be true/on/1/yes or false/off/0/no.")
+
+
+@contextmanager
+def sql_progress(stage):
+    """Log SQL stage timings; the background thread only reports waiting."""
+    started = time.monotonic()
+    stopped = threading.Event()
+    logger.info("TABLE_GUEST_DOB: %s.", stage)
+
+    def report_wait():
+        while not stopped.wait(SQL_PROGRESS_INTERVAL):
+            logger.info("TABLE_GUEST_DOB: still %s (%0.0fs elapsed).",
+                        stage, time.monotonic() - started)
+
+    reporter = threading.Thread(target=report_wait, daemon=True)
+    reporter.start()
+    try:
+        yield
+    except BaseException:
+        logger.warning("TABLE_GUEST_DOB: %s stopped after %.1fs.", stage, time.monotonic() - started)
+        raise
+    finally:
+        stopped.set()
+        reporter.join()
+    logger.info("TABLE_GUEST_DOB: %s completed in %.1fs.", stage, time.monotonic() - started)
+
+
 def ingest_rows(rows):
     """Atomically refresh fetched guest keys in the configured SQL Server table."""
+    if not sql_ingestion_enabled():
+        logger.info("TABLE_GUEST_DOB: SQL ingestion skipped (GUEST_DOB_SQL_ENABLED=false).")
+        return 0
     if not rows:
         logger.info("No guests fetched; SQL table left unchanged.")
         return 0
@@ -639,36 +689,52 @@ def ingest_rows(rows):
         unique_rows[(row["center_id"], row["guest_id"])] = row
     records = list(unique_rows.values())
     keys = list(unique_rows)
-    batch_size = 1000
+    batch_size = 1000  # two key parameters per row stay below SQL Server's 2,100 limit
+    insert_batch_size = 100
     from db_helper import get_connection
 
-    connection = get_connection()
+    logger.info("TABLE_GUEST_DOB: preparing SQL refresh for %s guest rows.", f"{len(records):,}")
+    logger.info("TABLE_GUEST_DOB: connection login timeout %ss per attempt; %s retries.",
+                os.getenv("DB_LOGIN_TIMEOUT", "30"), os.getenv("DB_CONNECT_RETRIES", "3"))
+    with sql_progress("connecting to SQL Server"):
+        connection = get_connection()
     try:
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-            """,
-            "dbo",
-            table_name,
-        )
-        actual_schema = {
-            name: ((data_type or "").lower(), char_length)
-            for name, data_type, char_length in cursor.fetchall()
-        }
-        if actual_schema != expected_schema:
-            raise ValueError(
-                f"{qualified_table} schema does not match the birthday export schema: "
-                f"{actual_schema}"
+        with sql_progress(f"checking table schema for {qualified_table}"):
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                """,
+                "dbo",
+                table_name,
             )
+            actual_schema = {
+                name: ((data_type or "").lower(), char_length)
+                for name, data_type, char_length in cursor.fetchall()
+            }
+            if actual_schema != expected_schema:
+                raise ValueError(
+                    f"{qualified_table} schema does not match the birthday export schema: "
+                    f"{actual_schema}"
+                )
 
-        delete_sql = (
-            f"DELETE FROM {qualified_table} WHERE [center_id] = ? AND [guest_id] = ?"
-        )
-        for offset in range(0, len(keys), batch_size):
-            cursor.executemany(delete_sql, keys[offset:offset + batch_size])
+        with sql_progress(f"clearing {len(keys):,} existing guest keys"):
+            for offset in range(0, len(keys), batch_size):
+                batch = keys[offset:offset + batch_size]
+                key_placeholders = ", ".join("(?, ?)" for _ in batch)
+                delete_sql = (
+                    f"DELETE target FROM {qualified_table} AS target "
+                    f"INNER JOIN (VALUES {key_placeholders}) AS incoming ([center_id], [guest_id]) "
+                    "ON target.[center_id] = incoming.[center_id] "
+                    "AND target.[guest_id] = incoming.[guest_id]"
+                )
+                logger.info("TABLE_GUEST_DOB: clearing keys %s through %s / %s in one SQL statement.",
+                            f"{offset + 1:,}", f"{offset + len(batch):,}", f"{len(keys):,}")
+                cursor.execute(delete_sql, *(value for key in batch for value in key))
+                logger.info("TABLE_GUEST_DOB: existing keys cleared %s / %s (pending commit).",
+                            f"{min(offset + batch_size, len(keys)):,}", f"{len(keys):,}")
 
         columns = ", ".join(f"[{column}]" for column in COLUMNS)
         placeholders = ", ".join("?" for _ in COLUMNS)
@@ -681,14 +747,22 @@ def ingest_rows(rows):
                 tuple(row[column] or None for column in COLUMNS)
                 for row in records
             ]
-            for offset in range(0, len(values), batch_size):
-                cursor.executemany(insert_sql, values[offset:offset + batch_size])
+            with sql_progress(f"inserting {len(values):,} guest rows"):
+                for offset in range(0, len(values), insert_batch_size):
+                    cursor.executemany(insert_sql, values[offset:offset + insert_batch_size])
+                    logger.info("TABLE_GUEST_DOB: inserted %s / %s rows (pending commit).",
+                                f"{min(offset + insert_batch_size, len(values)):,}", f"{len(values):,}")
         finally:
             cursor.fast_executemany = False
 
-        connection.commit()
+        with sql_progress("committing SQL transaction"):
+            connection.commit()
+        logger.info("TABLE_GUEST_DOB: committed %s / %s guest rows.",
+                    f"{len(records):,}", f"{len(records):,}")
     except Exception:
-        connection.rollback()
+        logger.warning("TABLE_GUEST_DOB: SQL update failed; rolling back the transaction.")
+        with sql_progress("rolling back SQL transaction"):
+            connection.rollback()
         raise
     finally:
         connection.close()
@@ -999,6 +1073,12 @@ def main():
     except OSError as exc:
         parser.error(f"Cannot open log file: {exc}")
     load_env(env_files)
+    try:
+        sql_enabled = sql_ingestion_enabled()
+    except ValueError as exc:
+        parser.error(str(exc))
+    logger.info("TABLE_GUEST_DOB: SQL ingestion %s (GUEST_DOB_SQL_ENABLED).",
+                "enabled" if sql_enabled else "disabled; CSV export only")
     key = (os.getenv("ZENOTI_API_KEY") or "").strip()
     if not key:
         searched = "\n".join(f"  {f}  ({'found' if f.is_file() else 'not found'})" for f in env_files)
@@ -1064,16 +1144,21 @@ def main():
         state = checkpoint.get_state()
         if output.exists():
             if args.resume and state["phase"] == "done":
-                logger.info("Export was already completed; retrying its SQL ingestion.")
+                logger.info("Export was already completed; using its saved guest rows.")
                 rows = checkpoint.load_rows()
                 checkpoint.close()
                 checkpoint = None
                 try:
-                    ingest_rows(rows)
+                    if sql_enabled:
+                        ingest_rows(rows)
                 except Exception as exc:
                     logger.error("SQL ingestion failed; export and checkpoint retained for retry: %s", exc)
                     raise SystemExit(1) from exc
-                checkpoint_path.unlink()
+                if sql_enabled:
+                    checkpoint_path.unlink()
+                else:
+                    logger.info("SQL ingestion skipped; completed checkpoint retained: %s", checkpoint_path)
+                logger.info("Finished in %s. CSV: %s", format_duration(time.monotonic() - run_started), output)
                 return
             raise ValueError(f"Output already exists: {output}. It will not be overwritten.")
         logger.info("Checkpoint: %s", checkpoint_path)
@@ -1101,11 +1186,15 @@ def main():
     if fallbacks:
         logger.info("%s guest(s) needed a separate detail request.", f"{fallbacks:,}")
     try:
-        ingest_rows(rows)
+        if sql_enabled:
+            ingest_rows(rows)
     except Exception as exc:
         logger.error("SQL ingestion failed; export retained: %s", exc)
         raise SystemExit(1) from exc
-    checkpoint_path.unlink()
+    if sql_enabled:
+        checkpoint_path.unlink()
+    else:
+        logger.info("SQL ingestion skipped; completed checkpoint retained: %s", checkpoint_path)
     logger.info("Finished in %s. CSV: %s", format_duration(time.monotonic() - run_started), output)
 
 

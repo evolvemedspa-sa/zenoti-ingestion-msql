@@ -19,6 +19,9 @@ Zenoti/dbquery/*
 Zenoti/zconnect/output/
 Zenoti/sample csv/
 
+# Generated guest birthday exports and checkpoints
+Zenoti/guest_birthdays_*.csv*
+
 # --- Environment Variables & Secrets ---
 .env
 .secret

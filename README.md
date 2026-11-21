@@ -126,6 +126,44 @@ See [PO / Transfer README](Zenoti/PO_Transfer/README.md) for its service configu
 
 See [Form export README](Zenoti/guest_form_retrieve/README.md) for optional authentication, host, request-body and deployment controls.
 
+## Guest birthday backfill
+
+[backfill_guest_birthdays.py](Zenoti/backfill_guest_birthdays.py) fetches guests
+created October 30 through November 20, 2026, inclusive, across all API-visible
+centers. It ignores `ZENOTI_CENTER_ID` and refreshes only the fetched guest keys
+in the configured `TABLE_GUEST_DOB` SQL table. API, checkpoint and SQL helpers are
+shared with the existing birthday job.
+
+```powershell
+& .\.venv\Scripts\python.exe Zenoti\backfill_guest_birthdays.py --from 2026-10-30 --to 2026-11-20
+```
+
+The default CSV is `Zenoti/guest_birthdays_all_2026-10-30_2026-11-20.csv`.
+Incomplete birthday details or unverifiable creation dates stop the run before
+SQL loading. Failed runs retain the export/checkpoint; use the same dates and
+`--resume` to continue. Use `--output` for a custom CSV path.
+SQL insertion progress is logged every 100 rows; the final commit is reported
+after the whole refresh succeeds. These logs are implemented in
+[get_guest_birthday_v3.py](Zenoti/get_guest_birthday_v3.py) and apply to both the
+daily birthday step in `run_all.py` and the backfill.
+Connection, schema checks, deletes, inserts and commit log their stage timings;
+slow SQL operations report that they are still waiting every 10 seconds.
+Existing keys are deleted in batches of up to 1,000 using one SQL statement per
+batch, matching both center and guest IDs within the same refresh transaction.
+
+Set this variable in Railway or your `.env` to control SQL ingestion for both
+birthday scripts (default: `true`):
+
+```dotenv
+GUEST_DOB_SQL_ENABLED=false
+```
+
+`true` / `on` / `1` / `yes` enables SQL; `false` / `off` / `0` / `no` exports
+CSV only, without requiring SQL credentials or opening a SQL connection. This
+setting controls only birthday ingestion. With SQL off, the completed checkpoint
+is retained; switch it on and run with `--resume`, the original `--output` and
+the same date/center filters to ingest saved data without fetching guests again.
+
 ## Dates and stock inventory
 
 | Workflow | Date selection | Notes |
