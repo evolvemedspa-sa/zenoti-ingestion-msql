@@ -27,6 +27,7 @@ Zenoti/sample csv/
 # --- IDEs and Editors ---
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
